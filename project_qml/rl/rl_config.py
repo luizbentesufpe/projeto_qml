@@ -12,10 +12,11 @@ class Config:
     L_max: int = 20
     allow_nop: bool = True
     calib_frac: float = 0.20
+    val_frac_search: float = 0.40  
     # Protocol (publication)
     # - Use reduced PERCENT for RL architecture search
     # - Use full data (100%) only for final evaluation / reporting
-    percent_search: int = 40 #25
+    percent_search: int = 60 #25
     percent_eval: int = 100
     holdout_frac: float = 0.20     # final untouched test holdout
     nested_cv_splits_outer: int = 5
@@ -24,16 +25,27 @@ class Config:
     bootstrap_B: int = 2000
     ci_alpha: float = 0.05
 
+    # novos knobs
+    use_patch_bank: bool = False
+    patch_bank_compact_features: bool = False
+    search_grid_size: int = 51         # COST: coarse grid during RL search
+    search_calib_cap: int = 256        # COST: small calib cap during search (was 1024)
+    final_calib_cap: int = 1024        # full cap for final evaluation
+
     grid_size: int = 201   # threshold calibration grid size
     # feature bank
-    feature_bank_size: int = 128
-    feature_bank_update: str = "saliency"   # "saliency" | "chi2" | "random" | "none"
+    feature_bank_size: int = 9
+    feature_bank_update: str = "none"   # "saliency" | "chi2" | "random" | "none"
     feature_bank_rescore_every: int = 25
 
-
+    std_proxy_threshold = 0.05 
+    
     # SEARCH AUC floor collapse gate
-    search_auc_floor = 0.55
-    search_auc_floor_collapse = 0.515
+    search_auc_floor = 0.50
+    reliable_score_min  = 0.75 
+
+    #search_auc_floor_collapse = 0.515
+    search_auc_gate_tau = 0.03
     search_auc_floor_streak = 3
     collapse_saturation_abslogit_p95_thr: float = 12.0
     collapse_prob_std_saturation: float = 1e-6
@@ -41,10 +53,10 @@ class Config:
     feature_bank_decay_enabled: bool = True
     feature_bank_schedule: Tuple[int, ...] = (128, 96, 64, 32)
     feature_bank_decay_every: int = 50 #10
-    feature_bank_min_size: int = 32
+    feature_bank_min_size: int = 3
 
     # patch bank
-    use_patch_bank: bool = True
+    use_patch_bank: bool = False
     patch_size: int = 4
     patch_stride: int = 4
 
@@ -60,7 +72,13 @@ class Config:
     collapse_streak_max: int = 5
 
     # NEW: stronger default repetition penalty (env-side)
-    repeat_penalty: float = 0.03
+    repeat_penalty: float = 0.01
+    # FIX-4: inter-episode architecture repeat penalty (terminal-level, not per-step).
+    # Per-step repeat_penalty fires on repeated ACTIONS within an episode; it cannot
+    # detect repeated ARCHITECTURES across episodes because recent_actions is cleared
+    # on reset(). This was the root cause of repeat=0.000 in eps 2-5 of the logs.
+    repeat_arch_penalty: float = 0.20        # NEW
+    repeat_arch_window: int = 50             # NEW — max hashes kept (bounded memory)
 
     # NEW: delta-proxy terminal reward mode (runner-side)
     terminal_use_delta_proxy: bool = True
@@ -70,17 +88,20 @@ class Config:
     # RL
     episodes: int = 400 #250
 
+    min_steps_before_nop: int = 5 
+
     n_steps: int = 15
     target_sync_steps: int = 512
     replay_capacity: int = 16384
     batch_size: int = 32
     eps_start: float = 1.0
-    eps_end: float = 0.05
-    eps_decay_steps: int = 12000 #8000inner_train_batches_head
+    eps_end: float = 0.10
+    eps_decay_steps: int = 20000 #8000inner_train_batches_head
 
+    search_lr_vqc: float = 0.015 
     # VQC inner training per env-step
-    inner_epochs_classif: int = 3 #3
-    lr_vqc: float = 0.005
+    inner_epochs_classif: int = 8 #3
+    lr_vqc: float = 0.01
 
     enc_affine_mode: str = "per_feature"
     enc_alpha_init: float = 1.0
@@ -89,7 +110,7 @@ class Config:
     # -------------------------
     # NEW: head optimizer knobs (Priority #1)
     # -------------------------
-    lr_head: float = 1e-2#6e-3 #3e-3
+    lr_head: float = 3e-2#6e-3 #3e-3
     wd_head: float = 0.0 #1e-4
     wd_vqc: float = 1e-4
 
@@ -97,6 +118,8 @@ class Config:
     clip_head: float = 5.0
     clip_body: float = 2.0
     clip_all: float = 2.0 
+
+    search_lr_head: float = 5e-2 
 
     normalize_inputs: bool = True
     norm_per_feature: bool = True     # per-feature mean/std (recommended for patch bank)
@@ -116,7 +139,11 @@ class Config:
     final_wd_enc: float = 0.0
     final_wd_theta: float = 0.0
     
+    search_head_only: bool = False
+    search_logit_scale_trainable: bool = True 
 
+    search_logit_scale_init:    float = 3.0   # novo parâmetro
+    search_lr_logit_scale:      float = 0.001  # novo parâmetro (15x menor que lr_vqc)
     collapse_logit_margin_min = 0.05
     collapse_prob_std_weak    = 0.01
     collapse_auc_eps          = 0.01
@@ -131,12 +158,12 @@ class Config:
     # NEW: anti-collapse retry (Priority #1)
     # -------------------------
     collapse_retry: bool = True
-    collapse_range_min: float = 0.05
-    collapse_std_min: float = 0.015
-    collapse_max_retry: int = 1
-    collapse_lr_scale: float = 0.5
-    collapse_boost_epochs: int = 2
-    collapse_boost_batches_mult: int = 2
+    collapse_range_min: float = 0.08
+    collapse_std_min: float = 0.02
+    collapse_max_retry: int = 3
+    collapse_lr_scale: float = 2.0
+    collapse_boost_epochs: int = 5
+    collapse_boost_batches_mult: int = 3
     collapse_boost_head_epochs: int = 1
 
 
@@ -154,7 +181,7 @@ class Config:
     thr_spec_min: float = 0.80  # constraint for @spec modes
     # focal loss
     use_focal: bool = True
-    focal_alpha: float = 0.25
+    focal_alpha: float = 0.5
     focal_gamma: float = 2.0
     # head clamp/clip
     head_weight_abs_max = 2.0
@@ -189,11 +216,12 @@ class Config:
     qubit_change_cooldown: int = 1
     qubit_penalty: float = 0.015
     
-    search_logit_scale_max = 200.0
-    search_logit_scale_min = 0.5
+    search_logit_scale_max = 8.0
+    search_logit_scale_min = 2.0 #3.0 se não tiver bom
     search_logit_scale_target = 2.0   # melhor começar menor (2 ou 3), não 8
     search_logit_scale_method = "p95"
 
+    search_inner_train_batches_vqc_override: int = -1 
     # budgets
     ENC_budget: int = 9
     ROT_budget: int = 17
@@ -203,8 +231,8 @@ class Config:
  
     calibrate_thr_on_train: bool = True    # thr* computed on train-subset, applied on val
     inner_train_subset_size: int = 2048
-    inner_train_batches_head: int = 5#3
-    inner_train_batches_vqc: int = 32 #16 #2 #3
+    inner_train_batches_head: int = 16#3
+    inner_train_batches_vqc: int = 32  #16 #2 #3
     inner_eval_batch_cap: int = 512 #1024#999999 #356 #128 #256 
     # Compute depth/cnot by tape less frequently (expensive)
     depth_check_every: int = 5             # compute tape-based depth every N steps
@@ -215,7 +243,7 @@ class Config:
 
     calib_prev_override: float | None = None
     recenter_after_warmup: bool = False
-    terminal_target_std: float = 1.0
+    terminal_target_std: float = 0.20 
     terminal_clip: float = 4.0
 
     # -------------------------
@@ -226,6 +254,14 @@ class Config:
     terminal_collapse_penalty: float = 0.05# penaliza colapso (específico para evitar "all-positive")
     collapse_log_every: int = 25           # log health a cada N episódios
 
+    terminal_reward_K: float = 5.0        # was 10.0 — base K halved for agg=min
+    terminal_K_start: float = 1.0         # K at episode 0
+    terminal_K_end: float = 5.0           # K at episode terminal_curriculum_K_T
+    terminal_curriculum_K_T: int = 120    # ramp duration in episodes
+    terminal_K_max: float = 10.0          # hard cap (unchanged)
+    # FIX-A: absolute-level bonus knobs
+    terminal_agg_floor: float = 0.30      # proxy_score below this → abs_signal = 0
+    terminal_K_abs: float = 0.5           # weight of abs_signal term
 
     
     # -------------------------------------------------
@@ -249,22 +285,36 @@ class Config:
     # NÍVEL 2 — reduzir gap RL -> train
     # -------------------------------------------------
     proxy_two_seeds: bool = True
+    proxy_n_seeds: int = 3 
     proxy_seed_delta: int = 1337
-    lambda_var: float = 0.50          # penaliza instabilidade entre seeds
-
+    #lambda_var: float = 0.50          # penaliza instabilidade entre seeds
+    proxy_aggregation: str = "mean"       # "mean" | "min" | "quantile20"
+    proxy_quantile: float = 0.20         # usado se aggregation="quantile20"
     # -------------------------------------------------
     # NÍVEL 3 — curriculum no reward
     # -------------------------------------------------
-    curriculum_T1: int = 80 #60
-    curriculum_T2: int = 200 #160
-    curriculum_w_metric_early: float = 0.2 #0.1
+    curriculum_T1: int = 40 #60
+    curriculum_T2: int = 100 #160
+    curriculum_w_metric_early: float = 0.4 #0.1
     curriculum_w_metric_mid: float = 0.5
     curriculum_w_metric_late: float = 1.0
+
+    # FIX-3: calib_seed_delta — large offset ensures calib cap never overlaps proxy seeds.
+    # val_bce < calib_bce was systematic in all 5 spike episodes (ep047,243,214,158,170).
+    # max proxy seed offset = (n_seeds-1)*proxy_seed_delta = 2*1337 = 2674 << 99991.
+    calib_seed_delta: int = 99991            # NEW — was implicit 0
+    lambda_var: float = 0.50                 # penaliza instabilidade entre seeds
+    # FIX-5: thr* stability penalty.
+    # 43.9% of evals in logs had prob_std < 0.02. Unstable thr* across seeds signals
+    # fragile separation → penalise it to align RL objective with clinical deployability.
+    lambda_thr_std: float = 0.60             # NEW
+    thr_std_threshold: float = 0.05          # NEW — std above this is penalised
+    log_thr_stability: bool = True           # NEW — write thr_stability log channel
 
     # logging de correlação RL vs final
     log_proxy_final_pairs: bool = True
     
-    patch_bank_compact_features: bool = True
+    patch_bank_compact_features: bool = False
     cost_measure_samples: int = 16
 
     phase: str = "search"  # "search" | "final"
@@ -305,11 +355,11 @@ class Config:
     # Phase-aware "cheap separation" knobs (Priority 2)
     # -------------------------------------------------
     # SEARCH: slightly more proxy training (still cheap on subset) to avoid probs collapse (0.35-0.50)
-    search_inner_epochs_classif: int = 1 #12 #8#15
-    search_inner_train_batches_vqc: int = 1 #16#32   # ~+50% over 16 by default
-    search_inner_train_batches_head: int = 50 #20#12 #6#10  # warmup head helps when collapsed
+    search_inner_epochs_classif: int = 6 #12 #8#15
+    search_inner_train_batches_vqc: int = 64 #32 #16#32   # ~+50% over 16 by default
+    search_inner_train_batches_head: int = 16 #50 #20#12 #6#10  # warmup head helps when collapsed
     search_terminal_diff_method: str = "backprop"
-    search_head_epochs: int = 10 #2
+    search_head_epochs: int = 8 #8 #2
 
     # FINAL: keep more strict / stable settings
     final_inner_epochs_classif: int = 15

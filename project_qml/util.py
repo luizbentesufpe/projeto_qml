@@ -61,29 +61,49 @@ def save_circuit_image(model,
                        title: str = ""):
     """
     Salva o circuito do QNode do modelo como imagem (PNG/PDF).
-    Robusto para múltiplos retornos do draw_mpl (fig, ax) ou lista.
+
+    FIX-E: três bugs corrigidos:
+      1. _q_single → _qnode  (atributo real do BinaryCQV_End2End)
+      2. drawer recebe os 4 argumentos de circuit():
+         (xi, theta_vec, enc_alpha_raw, enc_beta_raw)
+      3. o model deve usar diff_method='backprop' (default.qubit);
+         lightning não suporta draw_mpl — ver train.py para o model
+         temporário que garante isso.
     """
     import matplotlib.pyplot as plt
     import pennylane as qml
     import numpy as np
     import torch
 
-    # --- prepara inputs em CPU ---
+    # --- x em CPU ---
     x = np.asarray(x_ref, dtype=np.float32).reshape(-1)
     x_t = torch.as_tensor(x, dtype=torch.float32, device="cpu")
 
+    # --- theta (parâmetros variacionais ROT) ---
     theta = getattr(model, "theta", None)
     if theta is None:
         raise AttributeError("Model has no attribute 'theta'")
     theta_t = theta.detach().cpu()
 
-    qnode = getattr(model, "_q_single", None)
-    if qnode is None:
-        raise AttributeError("Model has no attribute '_q_single'")
+    # --- enc affine params (alpha_raw, beta_raw) ---
+    enc_alpha_raw = getattr(model, "enc_alpha_raw", None)
+    enc_beta_raw  = getattr(model, "enc_beta_raw",  None)
+    if enc_alpha_raw is None or enc_beta_raw is None:
+        raise AttributeError("Model has no enc_alpha_raw / enc_beta_raw")
+    alpha_t = enc_alpha_raw.detach().cpu()
+    beta_t  = enc_beta_raw.detach().cpu()
 
-    # --- desenha ---
+    # --- FIX-E bug 1: _q_single não existe; usar _qnode ---
+    qnode = getattr(model, "_q_single", None) or getattr(model, "_qnode", None)
+    if qnode is None:
+        raise AttributeError(
+            "Model has no drawable QNode (_q_single or _qnode). "
+            "Instancie o model com diff_method='backprop' (default.qubit)."
+        )
+
+    # --- FIX-E bug 3: passar os 4 argumentos de circuit() ---
     drawer = qml.draw_mpl(qnode, decimals=2, max_length=200)
-    out = drawer(x_t, theta_t)
+    out = drawer(x_t, theta_t, alpha_t, beta_t)
 
     # --- normaliza retorno ---
     figs = []

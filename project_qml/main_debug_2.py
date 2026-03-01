@@ -1,26 +1,21 @@
+from datetime import datetime
+import json
+from rl_and_qml_in_clinical_images.util import Logger
+from pathlib import Path
+import traceback
+from typing import Any, List
 
-"""
-Ablation runner for your RL-QCV pipeline.
+from typing import Dict
 
-What this adds on top of your current main():
-- ABLATIONS list (scenarios) with Config overrides
-- Runs: for each scenario -> for each seed -> for each nq in QUBITS_LIST
-- Keeps protocol:
-  * RL search uses percent_search (reduced)
-  * final reporting uses percent_eval (full)
-  * holdout is created from full data and NEVER used in RL-search
-  * nested CV on train_all, then one final holdout evaluation
-  * measured cost via tape-based mean depth/CNOT
-- Saves:
-  * one JSON per scenario
-  * one final aggregate JSON across scenarios
-
-Drop-in: paste below replacing your main() block (or create main_ablation()).
-"""
-
-# -------------------------
-# Main Ablation Runner
-# -------------------------
+from rl_and_qml_in_clinical_images.dataset import _make_search_splits_from_train_all, load_chestmnist_flatten
+from rl_and_qml_in_clinical_images.modeling.baselines import kfold_baselines_calibrated
+from rl_and_qml_in_clinical_images.modeling.ci import mean_ci_bootstrap, mean_ci_t
+from rl_and_qml_in_clinical_images.modeling.cost import measure_cost_from_arch, pareto_front
+from rl_and_qml_in_clinical_images.modeling.train import make_cfg_for_qubits, nested_cv_eval_fixed_arch, run_arch_search_end2end, split_holdout, train_final_model_end2end
+from rl_and_qml_in_clinical_images.rl.env import sanitize_architecture
+from rl_and_qml_in_clinical_images.rl.rl_config import Config, apply_overrides, build_ablation_scenarios, scenario_tag
+from rl_and_qml_in_clinical_images.util import dump_run_metadata, set_seeds
+import numpy as np
 
 from datetime import datetime
 import json
@@ -62,7 +57,61 @@ def _spearman(x, y):
     return _pearson(rx, ry)
 
 
-def main_ablation():
+
+def _minimalize_cfg_for_debug(cfg: Config, fixed_nq: int) -> Config:
+    """
+    Forces minimal compute while still exercising the full pipeline.
+    """
+    # RL search
+    cfg.episodes = 1
+    cfg.L_max = 4
+    cfg.n_steps = 2  # if your agent uses it
+
+    # data percentages (tiny)
+    cfg.percent_search = 1
+    cfg.percent_eval = 1
+
+    # inner loop (fast)
+    cfg.inner_train_subset_size = 32
+    cfg.inner_train_batches_head = 1
+    cfg.inner_train_batches_vqc = 1
+    cfg.inner_eval_batch_cap = 32
+    cfg.inner_epochs_classif = 1
+
+    # final training (fast)
+    cfg.final_epochs = 1
+    cfg.cost_measure_samples = 4  # minimal cost probe
+
+    # robustness for debug
+    cfg.use_focal = False
+    cfg.hard_block_budget = False
+
+    # stabilize qubits (kills many edge bugs)
+    cfg.start_qubits = fixed_nq
+    cfg.min_qubits = fixed_nq
+    cfg.max_qubits = fixed_nq
+
+    # nested cv minimal but non-trivial
+    cfg.nested_cv_splits_outer = 2
+    cfg.nested_cv_splits_inner = 2  # if used anywhere else
+
+    # CI lightweight
+    cfg.ci_method = str(cfg.ci_method)  # keep whatever you have
+    cfg.bootstrap_B = int(min(int(cfg.bootstrap_B), 200))
+    cfg.ci_alpha = float(cfg.ci_alpha)
+
+    return cfg
+
+
+
+def main_debug_ablation() -> None:
+    """
+    DEBUG ONLY.
+    Runs all scenarios with minimal compute but exercises ALL steps from main_ablation.
+    """
+    print("[DEBUG] entered main_debug_ablation()")
+
+    # Always decide device HERE, then pass it down (padronizado: device vem do train/main)
     try:
         import torch
 
@@ -70,52 +119,55 @@ def main_ablation():
     except Exception:
         DEVICE = "cpu"
 
-    print("[HB] entered main_ablation()")
-    root_out = Path("publication_out_ablation_2")
+    root_out = Path("DEBUG_ABLATION")
     root_out.mkdir(parents=True, exist_ok=True)
 
     # Base config
     cfg0 = Config()
-    
-    SEEDS = [0, 1, 2, 3, 4]
-    QUBITS_LIST = [4, 6, 8]
+    DEBUG_NQ = 4
+    cfg0 = _minimalize_cfg_for_debug(cfg0, fixed_nq=DEBUG_NQ)
 
-    PERCENT_SEARCH = int(cfg0.percent_search)
-    PERCENT_EVAL   = int(cfg0.percent_eval)
+    SEEDS = [0]
+    QUBITS_LIST = [DEBUG_NQ]  # fixed for debug
 
     scenarios = build_ablation_scenarios()
+    all_scenarios_index: List[Dict[str, Any]] = []
 
-    all_scenarios_results = []
-
+    
     for sc in scenarios:
         sc_name = str(sc["name"])
         sc_over = dict(sc.get("overrides", {}))
-        sc_tag  = scenario_tag(sc_name)
-        sc_sem  = str(sc.get("semantics_flag", "strong"))
+        sc_tag = scenario_tag(sc_name)
+        sc_sem = str(sc.get("semantics_flag", "strong"))
         sc_note = str(sc.get("notes", ""))
 
+        print(f"\n[DEBUG] Scenario: {sc_name} (tag={sc_tag}, semantics={sc_sem})")
 
         sc_dir = root_out / sc_tag
-        (sc_dir / "logs").mkdir(parents=True, exist_ok=True)
+        logs_dir = sc_dir / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
 
-        logger = Logger(sc_dir / "logs")
+        logger = Logger(logs_dir)
 
+        # Apply overrides to base cfg, then re-minimalize to avoid a scenario override making it huge
         cfg_base = apply_overrides(cfg0, sc_over)
+        cfg_base = _minimalize_cfg_for_debug(cfg_base, fixed_nq=DEBUG_NQ)
 
-        # Save scenario meta
         dump_run_metadata(
-            logger, cfg_base,
+            logger,
+            cfg_base,
             extra={
+                "mode": "DEBUG",
                 "scenario": sc_name,
                 "scenario_tag": sc_tag,
                 "semantics_flag": sc_sem,
                 "notes": sc_note,
                 "overrides": sc_over,
-                "percent_search": PERCENT_SEARCH,
-                "percent_eval": PERCENT_EVAL,
                 "seeds": SEEDS,
                 "qubits_list": QUBITS_LIST,
-            }
+                "percent_search": int(cfg_base.percent_search),
+                "percent_eval": int(cfg_base.percent_eval),
+            },
         )
 
         scenario_runs = []
@@ -127,7 +179,8 @@ def main_ablation():
                 w = csv.writer(f)
                 w.writerow(["scenario_tag", "seed", "nq_requested", "best_nq", "best_proxy_rl", "final_auc_nested"])
 
-
+        PERCENT_SEARCH = int(cfg_base.percent_search)
+        PERCENT_EVAL   = int(cfg_base.percent_eval)
         for seed in SEEDS:
             set_seeds(seed)
             dump_run_metadata(
@@ -337,7 +390,7 @@ def main_ablation():
         out_path.write_text(json.dumps(scenario_result, indent=2), encoding="utf-8")
         print(f"[OK] Saved scenario: {out_path}")
 
-        all_scenarios_results.append({
+        all_scenarios_index.append({
             "scenario": {"name": sc_name, "tag": sc_tag, "overrides": sc_over,
                 "semantics_flag": sc_sem, "notes": sc_note},
             "summary": {
@@ -352,12 +405,13 @@ def main_ablation():
     agg = {
         "meta": {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "n_scenarios": len(all_scenarios_results),
+            "n_scenarios": len(all_scenarios_index),
         },
-        "scenarios": all_scenarios_results
+        "scenarios": all_scenarios_index
     }
     agg_path = root_out / "ALL_SCENARIOS_INDEX.json"
     agg_path.write_text(json.dumps(agg, indent=2), encoding="utf-8")
     print(f"[OK] Saved aggregate index: {agg_path}")
+
 
 

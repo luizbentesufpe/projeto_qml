@@ -114,6 +114,29 @@ def select_feature_bank_chi2_patches(X_tr_flat: np.ndarray, y_tr_bin: np.ndarray
     topk = order[:min(k, Xp.shape[1])]
     return np.sort(topk)
 
+def select_feature_bank_variance(X_tr: np.ndarray, k: int) -> np.ndarray:
+    """
+    Simple tabular feature ranking by variance (descending).
+    Works for any real-valued X (can be negative), robust to NaN/Inf.
+    Returns sorted indices (ascending) of selected features.
+    """
+    X = np.asarray(X_tr, dtype=np.float32)
+    if X.ndim == 1:
+        X = X.reshape(-1, 1)
+    if X.size == 0:
+        return np.array([], dtype=np.int64)
+
+    # Replace NaN/Inf to avoid poisoning variance
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Variance per feature
+    v = np.var(X, axis=0).astype(np.float32)
+    v = np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+
+    order = np.argsort(-v)  # descending variance
+    topk = order[:min(int(k), int(X.shape[1]))]
+    return np.sort(topk).astype(np.int64, copy=False)
+
 
 @torch.no_grad()
 def compute_saliency_importance_pixels(model, X: torch.Tensor, Y: torch.Tensor=None, top_k=128):
@@ -186,10 +209,29 @@ def init_feature_bank(
         patch_groups=None
     ) -> np.ndarray:
 
-    mode = (mode or "none").lower()
+    mode = (mode or "none").lower().strip()
+    # normalize aliases
+    if mode in ("id", "identity", "none", "all"):
+        mode = "identity"
+    if mode in ("var", "variance", "tabular", "tabular_var", "tabular_variance"):
+        mode = "variance"
+
     if use_patch_bank:
         P = int(X_np.shape[1])
         k_max = int(min(k_max, P))
+        # -------------------------
+        # NEW: identity / none
+        # -------------------------
+        if mode == "identity":
+            # stable: first k features (0..k-1)
+            return np.arange(int(k_max), dtype=np.int64)
+
+        # -------------------------
+        # NEW: tabular variance mode
+        # (when X is already patch/compact features, variance is valid too)
+        # -------------------------
+        if mode == "variance":
+            return select_feature_bank_variance(X_np, k_max)
         if mode == "random":
             return select_feature_bank_random(P, k_max, seed=seed)
         if mode == "chi2":
@@ -206,6 +248,19 @@ def init_feature_bank(
     # pixels
     D = X_np.shape[1]
     k_max = int(min(k_max, D))
+
+    # -------------------------
+    # NEW: identity / none
+    # -------------------------
+    if mode == "identity":
+        return np.arange(int(k_max), dtype=np.int64)
+
+    # -------------------------
+    # NEW: variance mode for tabular
+    # -------------------------
+    if mode == "variance":
+        return select_feature_bank_variance(X_np, k_max)
+
     if mode == "random":
         return select_feature_bank_random(D, k_max, seed=seed)
     if mode == "chi2":
@@ -215,7 +270,6 @@ def init_feature_bank(
 
     # mix default
     k_chi = int(0.8 * k_max)
-    fb_chi = select_feature_bank_chi2_pixels(X_np, y_np, k_chi)
 
     if (D == 784) and (patch_groups is not None):
         fb_chi = select_feature_bank_chi2_patches(X_np, y_np, k_chi, patch_groups)

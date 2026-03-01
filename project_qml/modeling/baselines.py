@@ -25,6 +25,29 @@ def _eval_auc_sens(model, X, y):
     return float(auc), float(sens)
 
 
+def kfold_baselines(X, Y, seed=0, n_splits=5):
+    y = Y.reshape(-1).astype(int)
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+
+    models = {
+        "LR": Pipeline([("sc", StandardScaler()), ("m", LogisticRegression(max_iter=2000, class_weight="balanced"))]),
+        "SVM": Pipeline([("sc", StandardScaler()), ("m", SVC(probability=True, class_weight="balanced"))]),
+        "RF": RandomForestClassifier(n_estimators=300, class_weight="balanced", random_state=seed),
+    }
+
+    out = {}
+    for name, m in models.items():
+        aucs, sens = [], []
+        for tr, va in skf.split(X, y):
+            m.fit(X[tr], y[tr])
+            a, s = _eval_auc_sens(m, X[va], y[va])
+            aucs.append(a); sens.append(s)
+        out[name] = {
+            "aucs": aucs, "sens": sens,
+            "auc_mean": float(np.mean(aucs)), "auc_std": float(np.std(aucs)),
+            "sens_mean": float(np.mean(sens)), "sens_std": float(np.std(sens)),
+        }
+    return out
 
 
 def kfold_baselines_calibrated(X, Y, cfg: Config, seed=0, n_splits=5):

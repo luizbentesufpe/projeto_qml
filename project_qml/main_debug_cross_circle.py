@@ -21,13 +21,19 @@ Drop-in: paste below replacing your main() block (or create main_ablation()).
 # -------------------------
 # Main Ablation Runner
 # -------------------------
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import torch.nn.functional as F
+
 
 from datetime import datetime
 import json
 from rl_and_qml_in_clinical_images.util import Logger
 from pathlib import Path
 
-from rl_and_qml_in_clinical_images.dataset import _make_search_splits_from_train_all, load_chestmnist_flatten, load_chestmnist_pool_flatten
+from rl_and_qml_in_clinical_images.dataset import _make_search_splits_from_train_all, load_circle_cross_pool_flatten
 from rl_and_qml_in_clinical_images.modeling.baselines import kfold_baselines_calibrated
 from rl_and_qml_in_clinical_images.modeling.ci import mean_ci_bootstrap, mean_ci_t
 from rl_and_qml_in_clinical_images.modeling.cost import measure_cost_from_arch, pareto_front
@@ -47,6 +53,71 @@ os.environ["MKL_NUM_THREADS"] = "1"
 
 import csv
 
+
+def _plot_alpha_heatmap_3x3(
+    alpha_per_seed: list,          # list of np.ndarray (input_dim,), um por seed
+    out_path: str,
+    title: str = "α finais — Cross/Circle (3×3 patches)",
+    grid_shape: tuple = (3, 3),    # para Cross/Circle com 9 features
+):
+    """
+    Gera heatmap 3×3 dos α médios entre seeds.
+    Salva PNG em out_path.
+    """
+    import numpy as np
+
+    arrays = [np.asarray(a, dtype=np.float32) for a in alpha_per_seed if a is not None]
+    if len(arrays) == 0:
+        print("[WARN] Nenhum α disponível para heatmap.")
+        return
+
+    # média entre seeds
+    alpha_mean = np.mean(np.stack(arrays, axis=0), axis=0)  # (input_dim,)
+    alpha_std  = np.std( np.stack(arrays, axis=0), axis=0)
+
+    rows, cols = grid_shape
+    expected = rows * cols
+    if alpha_mean.shape[0] != expected:
+        print(f"[WARN] alpha shape {alpha_mean.shape[0]} ≠ grid {expected}. Truncando/padando.")
+        alpha_mean = np.resize(alpha_mean, expected)
+        alpha_std  = np.resize(alpha_std,  expected)
+
+    alpha_grid = alpha_mean.reshape(rows, cols)
+    std_grid   = alpha_std.reshape(rows, cols)
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    fig.suptitle(title, fontsize=13, fontweight="bold")
+
+    # --- heatmap α médio ---
+    ax = axes[0]
+    im = ax.imshow(alpha_grid, cmap="Blues", aspect="auto",
+                   vmin=float(alpha_grid.min()), vmax=float(alpha_grid.max()))
+    ax.set_title("α médio (entre seeds)", fontsize=11)
+    ax.set_xlabel("Coluna do patch"); ax.set_ylabel("Linha do patch")
+    for r in range(rows):
+        for c in range(cols):
+            ax.text(c, r, f"{alpha_grid[r,c]:.2f}", ha="center", va="center",
+                    fontsize=9, color="white" if alpha_grid[r,c] > alpha_grid.mean() else "black")
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    # --- heatmap std ---
+    ax2 = axes[1]
+    im2 = ax2.imshow(std_grid, cmap="Oranges", aspect="auto",
+                     vmin=0.0, vmax=float(std_grid.max()) + 1e-6)
+    ax2.set_title("std(α) entre seeds", fontsize=11)
+    ax2.set_xlabel("Coluna do patch"); ax2.set_ylabel("Linha do patch")
+    for r in range(rows):
+        for c in range(cols):
+            ax2.text(c, r, f"{std_grid[r,c]:.2f}", ha="center", va="center",
+                     fontsize=9, color="white" if std_grid[r,c] > std_grid.mean() else "black")
+    plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+    plt.savefig(str(out_path), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[OK] Heatmap salvo: {out_path}")
+
+
 def _pearson(x, y):
     x = np.asarray(x, dtype=np.float64); y = np.asarray(y, dtype=np.float64)
     if len(x) < 2: return float("nan")
@@ -62,7 +133,7 @@ def _spearman(x, y):
     return _pearson(rx, ry)
 
 
-def main_ablation():
+def main_debug_cross_circle():
     try:
         import torch
 
@@ -71,14 +142,15 @@ def main_ablation():
         DEVICE = "cpu"
 
     print("[HB] entered main_ablation()")
-    root_out = Path("publication_out_ablation_2")
+    root_out = Path("publication_out_ablation_cross_only_4_qubits")
     root_out.mkdir(parents=True, exist_ok=True)
 
     # Base config
     cfg0 = Config()
     
     SEEDS = [0, 1, 2, 3, 4]
-    QUBITS_LIST = [4, 6, 8]
+    #SEEDS = [0]
+    QUBITS_LIST = [4]
 
     PERCENT_SEARCH = int(cfg0.percent_search)
     PERCENT_EVAL   = int(cfg0.percent_eval)
@@ -142,7 +214,7 @@ def main_ablation():
             # X_full = np.concatenate([XtrF, XvaF, XteF], axis=0)
             # Y_full = np.concatenate([YtrF, YvaF, YteF], axis=0)
 
-            X_full, Y_full = load_chestmnist_pool_flatten(cfg_base, percent_total=int(PERCENT_EVAL), seed=int(seed))
+            X_full, Y_full = load_circle_cross_pool_flatten(cfg_base, percent_total=int(PERCENT_EVAL), seed=int(seed))
 
             # 2) Final untouched holdout
             tr_idx, ho_idx = split_holdout(X_full, Y_full, frac=float(cfg_base.holdout_frac), seed=seed)
@@ -153,12 +225,21 @@ def main_ablation():
             # (XtrS, YtrS), (XvaS, YvaS), (XteS, YteS) = load_chestmnist_flatten(
             #     cfg_base, percentage_each_split=PERCENT_SEARCH, seed=seed, allowed_indices=tr_idx
             # )
+            # FIX-1: pass val_frac_search from config (default 0.40).
+            # This grows the proxy eval set from ~128 to ~480 samples.
             (XtrS, YtrS), (XvaS, YvaS) = _make_search_splits_from_train_all(
                 X_train_all, Y_train_all,
                 percent_search=int(cfg_base.percent_search),
                 seed=int(seed),
                 val_frac=float(getattr(cfg_base, "val_frac_search", 0.40)),
             )
+
+            in_dim = int(XtrS.shape[1])  # aqui vai dar 9
+
+            # Se o seu Config tiver esses campos (ajuste conforme os nomes reais do seu Config)
+            for attr in ["feature_bank_size", "n_features", "in_dim", "d_in", "input_dim", "n_inputs"]:
+                if hasattr(cfg_base, attr):
+                    setattr(cfg_base, attr, in_dim)
             # # Baselines: evaluated on TRAIN ONLY (holdout untouched),
             # # with fold-train threshold calibration (thr*)
             # baselines = kfold_baselines_calibrated(
@@ -172,36 +253,67 @@ def main_ablation():
                 # Important: make_cfg_for_qubits may change feature_bank sizes (pixels domain)
                 # For patch-bank compact, apply_overrides already set domain to P patches,
                 # and make_cfg_for_qubits keeps it stable (because use_patch_bank True).
-                # cfg_nq = make_cfg_for_qubits(cfg_base, int(nq))
-                # ──Logger separado por (cenário × nq × seed) ──────────────
-                nq_dir = sc_dir / f"nq{nq}" / f"seed{seed}"
-                nq_dir.mkdir(parents=True, exist_ok=True)
-                nq_logger = Logger(nq_dir / "logs")
-
                 cfg_nq = make_cfg_for_qubits(cfg_base, int(nq))
+                in_dim = int(XtrS.shape[1])  # 9
+
+                cfg_nq.use_patch_bank = False
+                cfg_nq.feature_bank_update = "none"     # sem saliency
+                cfg_nq.feature_bank_size = in_dim       # 9
+                cfg_nq.feature_bank_min_size = in_dim   # 9
+                cfg_nq.feature_bank_schedule = (in_dim,)  # fixo em 9
+                in_dim = int(XtrS.shape[1])  # 9
+
+                for attr in ["feature_bank_size", "n_features", "in_dim", "d_in", "input_dim", "n_inputs"]:
+                    if hasattr(cfg_nq, attr):
+                        setattr(cfg_nq, attr, in_dim)
 
                 cfg_nq.start_qubits = int(nq)
                 cfg_nq.min_qubits   = max(4, int(nq) - 2)
                 cfg_nq.max_qubits   = min(10, int(nq) + 2)
 
                 dump_run_metadata(
-                    nq_logger, cfg_nq,
+                    logger, cfg_nq,
                     extra={"scenario": sc_name, "seed": seed, "n_qubits": int(nq),
                            "percent_search": PERCENT_SEARCH, "percent_eval": PERCENT_EVAL}
                 )
 
                 # RL search on reduced splits only
                 arch_mat, best_nq, best_proxy = run_arch_search_end2end(
-                    XtrS, YtrS, XvaS, YvaS, cfg=cfg_nq, logger=nq_logger, seed=seed, device=DEVICE
+                    XtrS, YtrS, XvaS, YvaS, cfg=cfg_nq, logger=logger, seed=seed, device=DEVICE
                 )
 
                 arch_mat = sanitize_architecture(arch_mat, int(best_nq))
 
                 # Nested CV on TRAIN_ALL (holdout untouched)
                 nested = nested_cv_eval_fixed_arch(
-                    arch_mat, X_train_all, Y_train_all, cfg=cfg_nq, n_qubits=int(best_nq), logger=nq_logger, seed=seed, device=DEVICE
+                    arch_mat, X_train_all, Y_train_all, cfg=cfg_nq, n_qubits=int(best_nq), logger=logger, seed=seed, device=DEVICE
                 )
 
+
+                # Freeze arch; train on TRAIN_ALL and evaluate once on HOLDOUT
+                auc_ho, sens_ho, thr_ho = train_final_model_end2end(
+                    arch_mat, int(best_nq),
+                    X_train_all, Y_train_all,
+                    X_holdout,  Y_holdout,
+                    cfg_nq, logger, device=DEVICE
+                )
+                # ─────────────────────────────────────────────────────────────
+                # ── Lê α/β salvos pelo train_final_model_end2end ─────────
+                _alpha_final = None
+                _beta_final  = None
+                try:
+                    _pt_path =  sc_dir / "logs" / "enc_params_final.pt"
+                    if _pt_path.exists():
+                        _enc = torch.load(str(_pt_path), map_location="cpu")
+                        _alpha_final = _enc.get("alpha", None)
+                        _beta_final  = _enc.get("beta",  None)
+                        if _alpha_final is not None:
+                            _alpha_final = _alpha_final.tolist()
+                            _beta_final  = _beta_final.tolist()
+                except Exception as _e:
+                    logger.log_to_file("enc_params", f"[WARN] could not load enc_params: {_e}")
+                # ─────────────────────────────────────────────────────────
+                # ─────────────────────────────────────────────────────────────
                 # --- log RL-proxy vs final AUC for correlation figure ---
                 try:
                     with open(corr_csv, "a", newline="") as f:
@@ -210,17 +322,8 @@ def main_ablation():
                                     ("" if best_proxy is None else float(best_proxy)),
                                     float(nested["auc_mean"])])
                 except Exception as e:
-                    nq_logger.log_to_file("corr", f"[WARN] could not append corr csv: {e}")
-
-
-                # Freeze arch; train on TRAIN_ALL and evaluate once on HOLDOUT
-                auc_ho, sens_ho, thr_ho = train_final_model_end2end(
-                    arch_mat, int(best_nq),
-                    X_train_all, Y_train_all,
-                    X_holdout,  Y_holdout,
-                    cfg_nq, nq_logger, device=DEVICE
-                )
-
+                    logger.log_to_file("corr", f"[WARN] could not append corr csv: {e}")
+                    
                 # Measured cost (tape-based)
                 X_ref = X_train_all[:max(64, int(cfg_nq.cost_measure_samples))]
                 cost_obj = measure_cost_from_arch(arch_mat, int(best_nq), cfg_nq, X_ref, seed=seed)
@@ -238,7 +341,12 @@ def main_ablation():
                     "perf": float(perf),
                     "cost": float(cost),
                     "budgets": {"ENC": int(cfg_nq.ENC_budget), "ROT": int(cfg_nq.ROT_budget), "CNOT": int(cfg_nq.CNOT_budget)},
-                    "measured_cost": cost_obj
+                    "measured_cost": cost_obj,
+                    "enc_params": {
+                        "alpha": _alpha_final,
+                        "beta":  _beta_final,
+                        "mode":  str(getattr(cfg_nq, "enc_affine_mode", "per_feature")),
+                    },
                 }
                 pareto_points.append({"seed": int(seed), "n_qubits": int(nq), "cost": float(cost), "perf": float(perf)})
 
@@ -259,6 +367,32 @@ def main_ablation():
                 "best_rlqcv": best,
                 "pareto": pareto_points
             })
+
+        # ── NOVO: gerar heatmap 3×3 dos α finais por cenário ────────────
+        try:
+            import numpy as np
+            alpha_per_seed = []
+            for r in scenario_runs:
+                best_r = r.get("best_rlqcv", {})
+                enc = best_r.get("enc_params", {}) if best_r else {}
+                a = enc.get("alpha", None)
+                if a is not None:
+                    alpha_per_seed.append(np.asarray(a, dtype=np.float32))
+
+            if len(alpha_per_seed) > 0:
+                heatmap_path = sc_dir / f"alpha_heatmap_{sc_tag}.png"
+                _plot_alpha_heatmap_3x3(
+                    alpha_per_seed=alpha_per_seed,
+                    out_path=str(heatmap_path),
+                    title=f"α finais — {sc_name}\n(média ± std entre {len(alpha_per_seed)} seeds)",
+                    grid_shape=(3, 3),   # Cross/Circle tem 9 features = 3×3
+                )
+                print(f"[OK] Heatmap α: {heatmap_path}")
+            else:
+                print(f"[WARN] Sem α disponíveis para heatmap do cenário {sc_tag}")
+        except Exception as e:
+            print(f"[WARN] Heatmap falhou para {sc_tag}: {e}")
+        # ─────────────────────────────────────────────────────────────────
 
         # Aggregate per-scenario
         best_per_seed = [r["best_rlqcv"] for r in scenario_runs]

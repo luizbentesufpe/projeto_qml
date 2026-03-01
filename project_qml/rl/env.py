@@ -130,6 +130,30 @@ def _safe_thr_grid(grid_size: int) -> np.ndarray:
     return np.linspace(eps, 1.0 - eps, gs, dtype=np.float32)
 
 
+def _bce_logits_loss_torch(logits: torch.Tensor, y: torch.Tensor, pos_weight: torch.Tensor | None = None) -> float:
+    """
+    BCEWithLogitsLoss em float, robusto para shapes.
+    Retorna float (python) para logging.
+    """
+    if logits.dim() > 1:
+        logits = logits.view(-1)
+    if y.dim() > 1:
+        y = y.view(-1)
+    y = y.to(dtype=logits.dtype)
+    crit = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    loss = crit(logits, y)
+    return float(loss.detach().cpu().item())
+
+def _ema_update(prev: float | None, x: float, alpha: float = 0.05) -> float:
+    """
+    EMA simples para suavizar loss por iteração.
+    """
+    x = float(x)
+    if prev is None or (not np.isfinite(prev)):
+        return x
+    return float((1.0 - float(alpha)) * float(prev) + float(alpha) * x)
+
+
 # -------------------------
 # State encoding helpers
 # -------------------------
@@ -534,6 +558,92 @@ class QMLEnvEnd2End:
 
 
         self._rng = np.random.default_rng(int(seed))
+
+        # ----------------------------------------------------------
+        # Domain detection: only build patch_groups for image-like inputs
+        # ----------------------------------------------------------
+        self.patch_groups = None
+        self.P = None
+
+        # Prefer explicit cfg flag if you add it; fallback to input_dim==784.
+        # This makes env robust for tabular / toy datasets.
+        input_dim_now = int(self.X_tr.shape[1]) if self.X_tr.dim() == 2 else int(self.X_tr.view(self.X_tr.shape[0], -1).shape[1])
+        cfg_input_kind = str(getattr(self.cfg, "input_kind", "")).lower().strip()  # optional: "image" | "tabular"
+        self.is_image_like = bool(cfg_input_kind == "image" or input_dim_now == 784)
+
+        if self.is_image_like and bool(getattr(self.cfg, "use_patch_bank", False)):
+            self.patch_groups = make_patch_groups(28, 28, cfg.patch_size, cfg.patch_stride)
+            self.P = int(len(self.patch_groups))
+            self.logger.log_to_file(
+                "patchify",
+                f"[patch_groups] enabled is_image_like=1 P={self.P} patch={cfg.patch_size} stride={cfg.patch_stride}",
+            )
+        else:
+            self.logger.log_to_file(
+                "patchify",
+                f"[patch_groups] disabled is_image_like={int(self.is_image_like)} use_patch_bank={int(bool(getattr(self.cfg,'use_patch_bank',False)))} input_dim={input_dim_now}",
+            )
+
+        # ----------------------------------------------------------
+        # Effective feature-bank sizing / schedule (patch-bank aware)
+        # ----------------------------------------------------------
+        # Goal:
+        # - When use_patch_bank=True, the maximum meaningful "feature id space"
+        #   is bounded by P patches (esp. when patch_bank_compact_features=True).
+        # - Even in your diagnostic mode (use_patch_bank=True, compact=False),
+        #   you typically set feature_bank_size=P (e.g., 49). Using min(...,P)
+        #   keeps everything consistent and prevents action indices > P.
+        if bool(self.cfg.use_patch_bank) and (self.P is not None):
+            max_k = int(min(int(self.cfg.feature_bank_size), int(self.P)))
+            min_k = int(min(int(self.cfg.feature_bank_min_size), int(max_k)))
+
+            self.feature_bank_size_eff = int(max_k)
+            self.feature_bank_min_eff  = int(min_k)
+
+            # Schedule source MUST be cfg.feature_bank_schedule (tuple),
+            # not feature_bank_size (int).
+            sched = tuple(getattr(self.cfg, "feature_bank_schedule", ()))
+            if len(sched) == 0:
+                sched = (int(max_k),)
+
+            # Clamp schedule values into [min_k, max_k] and keep them ints
+            self.feature_bank_schedule_eff = tuple(
+                int(np.clip(int(k), int(min_k), int(max_k))) for k in sched
+            )
+        else:
+            # Non patch-bank: keep original domain (pixels / external features)
+            self.feature_bank_size_eff = int(self.cfg.feature_bank_size)
+            self.feature_bank_min_eff  = int(min(int(self.cfg.feature_bank_min_size), int(self.feature_bank_size_eff)))
+
+            sched = tuple(getattr(self.cfg, "feature_bank_schedule", ()))
+            if len(sched) == 0:
+                sched = (int(self.feature_bank_size_eff),)
+            self.feature_bank_schedule_eff = tuple(
+                int(np.clip(int(k), int(self.feature_bank_min_eff), int(self.feature_bank_size_eff))) for k in sched
+            )
+
+        # >>> CRITICAL FIX (semantic correctness): compact patch features => X becomes (B,P)
+        if bool(self.cfg.use_patch_bank) and bool(getattr(self.cfg, "patch_bank_compact_features", False)
+                                                   and (self.patch_groups is not None) and bool(self.is_image_like)):
+            Dtr = int(self.X_tr.shape[1])
+            Dva = int(self.X_val.shape[1])
+            if Dtr == 784 and Dva == 784:
+                self.X_tr = patchify_mean_flat(self.X_tr, self.patch_groups, device=self.DEVICE)
+                self.X_val = patchify_mean_flat(self.X_val, self.patch_groups, device=self.DEVICE)
+                logger.log_to_file(
+                    "patchify",
+                    f"[compact] X_tr -> {tuple(self.X_tr.shape)}  X_val -> {tuple(self.X_val.shape)} (P={self.P})",
+                )
+            else:
+                # Already compact (e.g., D=P=49 or other feature pipeline). Don't patchify twice.
+                logger.log_to_file(
+                    "patchify",
+                    f"[skip compact] X already compact? X_tr.shape={tuple(self.X_tr.shape)} X_val.shape={tuple(self.X_val.shape)} "
+                    f"(expected 784 to patchify; P={self.P})",
+                )
+
+        if len(self.feature_bank_schedule_eff) == 0:
+            self.feature_bank_schedule_eff = (int(self.cfg.feature_bank_size),)
         # ==========================================================
         # NEW: Input normalization (train stats -> apply train/val)
         # Goal: increase separability to avoid probs collapsing ~0.4
@@ -574,72 +684,6 @@ class QMLEnvEnd2End:
                 f"[norm] enabled per_feature={per_feature} eps={eps} clip={clip} tanh={use_tanh} "
                 f"X_tr.shape={tuple(self.X_tr.shape)} X_val.shape={tuple(self.X_val.shape)}",
             )
-        # patch groups (fixo)
-        self.patch_groups = make_patch_groups(28, 28, cfg.patch_size, cfg.patch_stride)
-        P = int(len(self.patch_groups))
-        self.P = P  # keep as env attribute if you need later
-
-        # ----------------------------------------------------------
-        # Effective feature-bank sizing / schedule (patch-bank aware)
-        # ----------------------------------------------------------
-        # Goal:
-        # - When use_patch_bank=True, the maximum meaningful "feature id space"
-        #   is bounded by P patches (esp. when patch_bank_compact_features=True).
-        # - Even in your diagnostic mode (use_patch_bank=True, compact=False),
-        #   you typically set feature_bank_size=P (e.g., 49). Using min(...,P)
-        #   keeps everything consistent and prevents action indices > P.
-        if bool(self.cfg.use_patch_bank):
-            max_k = int(min(int(self.cfg.feature_bank_size), int(P)))
-            min_k = int(min(int(self.cfg.feature_bank_min_size), int(max_k)))
-
-            self.feature_bank_size_eff = int(max_k)
-            self.feature_bank_min_eff  = int(min_k)
-
-            # Schedule source MUST be cfg.feature_bank_schedule (tuple),
-            # not feature_bank_size (int).
-            sched = tuple(getattr(self.cfg, "feature_bank_schedule", ()))
-            if len(sched) == 0:
-                sched = (int(max_k),)
-
-            # Clamp schedule values into [min_k, max_k] and keep them ints
-            self.feature_bank_schedule_eff = tuple(
-                int(np.clip(int(k), int(min_k), int(max_k))) for k in sched
-            )
-        else:
-            # Non patch-bank: keep original domain (pixels / external features)
-            self.feature_bank_size_eff = int(self.cfg.feature_bank_size)
-            self.feature_bank_min_eff  = int(min(int(self.cfg.feature_bank_min_size), int(self.feature_bank_size_eff)))
-
-            sched = tuple(getattr(self.cfg, "feature_bank_schedule", ()))
-            if len(sched) == 0:
-                sched = (int(self.feature_bank_size_eff),)
-            self.feature_bank_schedule_eff = tuple(
-                int(np.clip(int(k), int(self.feature_bank_min_eff), int(self.feature_bank_size_eff))) for k in sched
-            )
-
-        # >>> CRITICAL FIX (semantic correctness): compact patch features => X becomes (B,P)
-        if bool(self.cfg.use_patch_bank) and bool(getattr(self.cfg, "patch_bank_compact_features", False)):
-            Dtr = int(self.X_tr.shape[1])
-            Dva = int(self.X_val.shape[1])
-            if Dtr == 784 and Dva == 784:
-                self.X_tr = patchify_mean_flat(self.X_tr, self.patch_groups, device=self.DEVICE)
-                self.X_val = patchify_mean_flat(self.X_val, self.patch_groups, device=self.DEVICE)
-                logger.log_to_file(
-                    "patchify",
-                    f"[compact] X_tr -> {tuple(self.X_tr.shape)}  X_val -> {tuple(self.X_val.shape)} (P={P})",
-                )
-            else:
-                # Already compact (e.g., D=P=49 or other feature pipeline). Don't patchify twice.
-                logger.log_to_file(
-                    "patchify",
-                    f"[skip compact] X already compact? X_tr.shape={tuple(self.X_tr.shape)} X_val.shape={tuple(self.X_val.shape)} "
-                    f"(expected 784 to patchify; P={P})",
-                )
-
-        if len(self.feature_bank_schedule_eff) == 0:
-            self.feature_bank_schedule_eff = (int(self.cfg.feature_bank_size),)
-
-
         self.ACTIONS = build_action_list_superset(
             int(cfg.max_qubits),
             int(self.feature_bank_size_eff),
@@ -670,6 +714,14 @@ class QMLEnvEnd2End:
 
         self._recent_actions_q = deque(maxlen=int(getattr(cfg, "recent_actions_maxlen", 512)))
         self.recent_actions = set()
+        # FIX-4: persistent inter-episode arch dedup set.
+        # Prevents same terminal architecture from being rewarded without penalty
+        # across episodes (root cause of repeat=0.000 in eps 2-5).
+        self._terminal_arch_hashes: set = set()
+        self._ep_count: int = 0
+        # FIX-5: thr* per-seed list for stability penalty in train.py
+        self._terminal_thr_stars: list = []
+
 
         self.current_bank_k = int(self.feature_bank_size_eff)
         self.episode_times = []
@@ -684,7 +736,8 @@ class QMLEnvEnd2End:
         self._depth_ref_cached = float(getattr(cfg, "depth_ref_default", 10.0))
         self._last_depth_raw = 0.0
         self._calib_cache = {}
-
+        self._arch_result_cache: dict = {}
+        self._arch_result_cache_maxsize: int = 64
 
         self.feature_bank = None
         self.reset()
@@ -841,10 +894,18 @@ class QMLEnvEnd2End:
             model.set_logit_scale_trainable(True)
         else:
             # freeze in SEARCH + set temperature
-            model.set_clamp_logits(False) 
-            ls = float(getattr(self.cfg, "search_logit_scale", 10.0))
-            model.logit_scale_eval_only = True
-            model.set_logit_scale_trainable(False, value=ls)
+            # SEARCH: trainable com range restrito para estabilidade
+            # Razão: logit_scale=10.0 fixo + VQC features de baixa variância
+            # => sigmoid satura tudo perto de 0 => Pcollapsed=37% (visto nos logs)
+            search_ls_trainable = bool(getattr(self.cfg, "search_logit_scale_trainable", True))
+            ls_init = float(getattr(self.cfg, "search_logit_scale", 2.0))   # init baixo evita saturação imediata
+            model.set_clamp_logits(False)
+            model.logit_scale_eval_only = False
+            model.set_logit_scale_trainable(search_ls_trainable, value=ls_init)
+            # Restringir range: escala pequena no início -> o modelo calibra via gradiente
+            model.logit_scale_min = float(getattr(self.cfg, "search_logit_scale_min", 0.5))
+            model.logit_scale_max = float(getattr(self.cfg, "search_logit_scale_max", 8.0))
+
 
         return model
 
@@ -907,30 +968,41 @@ class QMLEnvEnd2End:
 
         self.current_n_qubits = int(self.cfg.start_qubits)
         self._qubit_cooldown = 0
-        self._recent_actions_q.clear()
-        self.recent_actions.clear()
+        # self._recent_actions_q.clear()
+        # self.recent_actions.clear()
+        # FIX-4: clear per-episode action history only after episode 0.
+        # The guard prevents early-episode "forgetting" of inter-episode arch hashes.
+        if self._ep_count > 0:
+            self._recent_actions_q.clear()
+            self.recent_actions.clear()
+        # _terminal_arch_hashes is intentionally NEVER cleared here.
+        self._terminal_thr_stars = []   # reset thr* list each episode
+        self._ep_count += 1
 
-        if bool(self.cfg.use_patch_bank) and bool(self.cfg.patch_bank_compact_features):
-            X_bank = self.X_tr.detach().cpu().numpy()  # já (B,P)
-            # init_feature_bank precisa suportar "patch" direto; se não suportar,
-            # crie init_feature_bank_patches_simple que retorna range(P) ou saliency patch-based
-        else:
-            X_bank = self.X_tr_raw.detach().cpu().numpy()  # (B,784)
+
+        # if bool(self.cfg.use_patch_bank) and bool(self.cfg.patch_bank_compact_features):
+        #     X_bank = self.X_tr.detach().cpu().numpy()  # já (B,P)
+        #     # init_feature_bank precisa suportar "patch" direto; se não suportar,
+        #     # crie init_feature_bank_patches_simple que retorna range(P) ou saliency patch-based
+        # else:
+        #     X_bank = self.X_tr_raw.detach().cpu().numpy()  # (B,784)
+        X_bank = self.X_tr.detach().cpu().numpy().astype(np.float32)
 
         if self.feature_bank is None:
-            # Use the same domain the policy will act on:
-            # - compact patch bank: X_tr is (B,P)
-            # - else: raw is (B,784)
-            X_raw_np = self.X_tr_raw.detach().cpu().numpy().astype(np.float32)  # raw domain (before normalization)
+            # # Use the same domain the policy will act on:
+            # # - compact patch bank: X_tr is (B,P)
+            # # - else: raw is (B,784)
+            # X_raw_np = self.X_tr_raw.detach().cpu().numpy().astype(np.float32)  # raw domain (before normalization)
             y_np = (self.Y_tr.detach().cpu().numpy().reshape(-1) > 0.5).astype(np.int32)
 
-            if bool(self.cfg.use_patch_bank) and bool(getattr(self.cfg, "patch_bank_compact_features", False)):
-                # raw pixels -> patch means (non-negative if pixels are in [0,1])
-                # NOTE: patchify_mean_flat returns torch.Tensor; convert to numpy
-                Xp = patchify_mean_flat(X_raw_np, self.patch_groups, device=self.DEVICE).detach().cpu().numpy().astype(np.float32)
-                X_np_for_fb = Xp
-            else:
-                X_np_for_fb = X_raw_np
+            # if bool(self.cfg.use_patch_bank) and bool(getattr(self.cfg, "patch_bank_compact_features", False)):
+            #     # raw pixels -> patch means (non-negative if pixels are in [0,1])
+            #     # NOTE: patchify_mean_flat returns torch.Tensor; convert to numpy
+            #     Xp = patchify_mean_flat(X_raw_np, self.patch_groups, device=self.DEVICE).detach().cpu().numpy().astype(np.float32)
+            #     X_np_for_fb = Xp
+            # else:
+            #     X_np_for_fb = X_raw_np
+            X_np_for_fb = X_bank
 
             self.feature_bank = init_feature_bank(
                 X_np_for_fb,
@@ -938,8 +1010,8 @@ class QMLEnvEnd2End:
                 k_max=int(getattr(self, "feature_bank_size_eff", self.cfg.feature_bank_size)),
                 mode=str(self.cfg.feature_bank_update),
                 seed=int(self.seed),
-                use_patch_bank=bool(self.cfg.use_patch_bank),
-                patch_groups=self.patch_groups,
+                use_patch_bank=bool(self.cfg.use_patch_bank and (self.patch_groups is not None) and self.is_image_like),
+                patch_groups=(self.patch_groups if (self.patch_groups is not None and self.is_image_like) else None),
             )
             self.logger.log_to_file(
                 "feature_bank",
@@ -1042,7 +1114,7 @@ class QMLEnvEnd2End:
         youden01 = float(0.5 * (youden + 1.0))  # map [-1,1] -> [0,1]
         proxy_metric = 0.5 * auc01 + 0.5 * youden01  # [0,1]
 
-        mscale = float(getattr(self.cfg, "metric_shaping_scale", 0.05))
+        mscale = float(getattr(self.cfg, "metric_shaping_scale", 0.20))
         w = float(getattr(self, "_metric_weight", 1.0))
         comp_metric = float(w * mscale * (proxy_metric - 0.5))
 
@@ -1084,7 +1156,7 @@ class QMLEnvEnd2End:
 
         comp_repeat = 0.0
         if action_key in self.recent_actions:
-            rep = float(getattr(self.cfg, "repeat_penalty", 0.03))
+            rep = float(getattr(self.cfg, "repeat_penalty", 0.01))
             comp_repeat = -abs(rep)
             reward += float(comp_repeat)
 
@@ -1215,7 +1287,22 @@ class QMLEnvEnd2End:
                 # inconsistente com ACTIONS/mask => erro forte como você tinha
                 raise RuntimeError(f"ENC index out of range: b={b} bank_k={self.current_bank_k}")
 
-            feat_global = int(self.feature_bank[int(b)])
+            # feat_global = int(self.feature_bank[int(b)])
+            # Domain-agnostic mapping:
+            # - if feature_bank is defined: bank idx -> selected global feature idx
+            # - else: treat b directly as a feature index (tabular/identity fallback)
+            if (self.feature_bank is None) or (len(self.feature_bank) == 0):
+                feat_global = int(b)
+            else:
+                feat_global = int(self.feature_bank[int(b)])
+
+            # final safety: keep feature in range of current input dim
+            input_dim = int(self.X_tr.shape[1])
+            if feat_global < 0 or feat_global >= input_dim:
+                raise RuntimeError(
+                    f"ENC feature out of input range: feat_global={feat_global} input_dim={input_dim} "
+                    f"(bank_k={self.current_bank_k}, b={b})"
+                )
             action = ("ENC", ax, q, feat_global)
 
         # ==========================================================
@@ -1310,7 +1397,9 @@ class QMLEnvEnd2End:
         return self.state.copy(), float(reward), bool(done), info
 
     def maybe_rescore_feature_bank_saliency(self, arch_use: np.ndarray) -> None:
-        if self.cfg.feature_bank_update.lower() != "saliency":
+        if str(getattr(self.cfg, "feature_bank_update", "none")).lower() != "saliency":
+            return
+        if self.X_tr is None or self.Y_tr is None:
             return
 
         model = self._build_model(
@@ -1320,22 +1409,44 @@ class QMLEnvEnd2End:
 
         
 
-        if bool(self.cfg.use_patch_bank):
+        # if bool(self.cfg.use_patch_bank):
+        #     sal = compute_saliency_importance_patches(
+        #         model,
+        #         self.X_tr,
+        #         self.Y_tr,
+        #         top_k=int(self.cfg.feature_bank_size),
+        #     )
+        #     self.feature_bank = sal[: int(self.cfg.feature_bank_size)]
+        # else:
+        #     sal = compute_saliency_importance_pixels(
+        #         model,
+        #         self.X_tr,
+        #         self.Y_tr,
+        #         top_k=self.cfg.feature_bank_size,
+        #     )
+        #     self.feature_bank = sal[: self.cfg.feature_bank_size]
+        # If patch-bank saliency is requested, require a coherent patch domain.
+        if bool(getattr(self.cfg, "use_patch_bank", False)):
+            if (self.patch_groups is None) or (not bool(getattr(self, "is_image_like", False))):
+                # No-op: cannot compute patch saliency without patch domain
+                return
             sal = compute_saliency_importance_patches(
                 model,
                 self.X_tr,
                 self.Y_tr,
-                top_k=int(self.cfg.feature_bank_size),
+                top_k=int(self.feature_bank_size_eff),
             )
-            self.feature_bank = sal[: int(self.cfg.feature_bank_size)]
-        else:
-            sal = compute_saliency_importance_pixels(
-                model,
-                self.X_tr,
-                self.Y_tr,
-                top_k=self.cfg.feature_bank_size,
-            )
-            self.feature_bank = sal[: self.cfg.feature_bank_size]
+            self.feature_bank = np.asarray(sal[: int(self.feature_bank_size_eff)], dtype=np.int64)
+            return
+
+        # Pixel / generic saliency (works for any vector input)
+        sal = compute_saliency_importance_pixels(
+            model,
+            self.X_tr,
+            self.Y_tr,
+            top_k=int(self.feature_bank_size_eff),
+        )
+        self.feature_bank = np.asarray(sal[: int(self.feature_bank_size_eff)], dtype=np.int64)
 
     def terminal_evaluate(self):
         """
@@ -1349,7 +1460,29 @@ class QMLEnvEnd2End:
         """
         sens_tgt, spec_min, fpr_max = get_thr_targets(self.cfg)
         t0 = time.perf_counter()
+        _arch_cache_key = hash(self.state.tobytes())
+        if _arch_cache_key in self._arch_result_cache:
+            _cached = self._arch_result_cache[_arch_cache_key]
+            self.last_auc, self.last_sens, self.last_spec = float(_cached[0]), float(_cached[1]), float(_cached[2])
+            self.thr = float(_cached[3])
+            try:
+                self.logger.log_to_file("terminal_splits", f"[arch_cache_HIT] auc={_cached[0]:.4f}")
+            except Exception:
+                pass
+            return _cached
+        
         arch = torch.tensor(self.state, dtype=torch.int64, device=self.DEVICE)
+        try:
+            _yv = (self.Y_val.detach().cpu().numpy().reshape(-1) > 0.5).astype(np.int32)
+            _nv = int(len(_yv))
+            self.logger.log_to_file(
+                "terminal_splits",
+                f"[N_val] total={_nv} pos={int(_yv.sum())} neg={_nv - int(_yv.sum())} "
+                f"val_frac={getattr(self.cfg,'val_frac_search',0.40):.2f} "
+                f"percent_search={getattr(self.cfg,'percent_search',60)}"
+            )
+        except Exception:
+            pass
         sens_tgt, spec_min, fpr_max = get_thr_targets(self.cfg)
         thr_sens_target = float(sens_tgt)
         thr_spec_min = float(spec_min)
@@ -1439,9 +1572,17 @@ class QMLEnvEnd2End:
             # ONLY through architecture actions, not gradients.
             # ----------------------------------------------------------
             phase_local = str(getattr(self.cfg, "phase", "search")).lower()
-            search_head_only = bool(getattr(self.cfg, "search_head_only", True)) and (not phase_local.startswith("final"))
-            # Optional: allow a small number of VQC batches even in SEARCH (default 0)
-            search_vqc_batches_override = int(getattr(self.cfg, "search_inner_train_batches_vqc_override", 0))
+            # search_head_only = bool(getattr(self.cfg, "search_head_only", True)) and (not phase_local.startswith("final"))
+            # # Optional: allow a small number of VQC batches even in SEARCH (default 0)
+            # search_vqc_batches_override = int(getattr(self.cfg, "search_inner_train_batches_vqc_override", 0))
+            # CORREÇÃO: default False — VQC precisa de gradiente no search
+            # Evidência: TEST4 mostrou VQC congelado AUC=0.573 vs end2end AUC=0.798
+            # Com search_head_only=True o VQC recebia 0 batches de gradiente em 291 episódios
+            search_head_only = bool(getattr(self.cfg, "search_head_only", False)) and (not phase_local.startswith("final"))
+            # batches VQC no search: usa inner_train_batches_vqc diretamente (sem override para 0)
+            search_vqc_batches_override = int(getattr(self.cfg, "search_inner_train_batches_vqc_override", -1))
+            # -1 = "não usar override, usar n_vqc_batches do config"
+
 
             def _freeze_vqc_params(model):
                 # Freeze everything first...
@@ -1514,25 +1655,48 @@ class QMLEnvEnd2End:
                     + int(seed_offset)
                 )
                 self._calib_cache[key] = (X_cal, Y_cal)
+                # try:
+                #     ycal = (Y_cal.detach().cpu().numpy().reshape(-1) > 0.5).astype(np.int32)
+                #     pos = int(ycal.sum())
+                #     tot = int(ycal.shape[0])
+                #     self.logger.log_to_file(
+                #         "thr",
+                #         f"[calib] fixed_stratified cap={cap_eff} seed_off={seed_offset} "
+                #         f"pos={int(pos)}/{int(tot)}",
+                #     )
+
+                #     self.logger.log_to_file(
+                #         "calib",
+                #         f"[calib] fixed_stratified cap={cap_eff} "
+                #         f"seed_base={self.seed} "
+                #         f"seed_off={seed_offset} "
+                #         f"seed_for_cap={seed_for_cap} "
+                #         f"pos={pos}/{cap_eff}"
+                #     )
+
+                # except Exception:
+                #     pass
+                # FIX-C: confirm FIX-3 — log N_calib, seed lineage, structural overlap.
+                # calib ⊂ X_tr and val ⊂ X_val → structurally disjoint → overlap always 0.
+                # Logging the seed lineage lets you verify calib independence after the fact.
                 try:
                     ycal = (Y_cal.detach().cpu().numpy().reshape(-1) > 0.5).astype(np.int32)
-                    pos = int(ycal.sum())
-                    tot = int(ycal.shape[0])
+                    pos  = int(ycal.sum())
+                    tot  = int(ycal.shape[0])
+                    _csd = int(getattr(self.cfg, "calib_seed_delta", 99991))
+                    self.logger.log_to_file(
+                        "terminal_splits",
+                        f"[N_calib] total={tot} pos={pos} neg={tot-pos} "
+                        f"seed_base={self.seed} seed_off={seed_offset} "
+                        f"calib_seed_delta={_csd} seed_for_cap={seed_for_cap} "
+                        f"calib∩val_overlap=0(structural:X_tr⊥X_val)"
+                    )
+                    # legacy log kept for backwards compatibility
                     self.logger.log_to_file(
                         "thr",
                         f"[calib] fixed_stratified cap={cap_eff} seed_off={seed_offset} "
-                        f"pos={int(pos)}/{int(tot)}",
+                        f"pos={pos}/{tot} calib_seed_delta={_csd}",
                     )
-
-                    self.logger.log_to_file(
-                        "calib",
-                        f"[calib] fixed_stratified cap={cap_eff} "
-                        f"seed_base={self.seed} "
-                        f"seed_off={seed_offset} "
-                        f"seed_for_cap={seed_for_cap} "
-                        f"pos={pos}/{cap_eff}"
-                    )
-
                 except Exception:
                     pass
                 return X_cal, Y_cal
@@ -1633,7 +1797,7 @@ class QMLEnvEnd2End:
                 phase_l = str(getattr(self.cfg, "phase", "search")).lower()
                 is_search = phase_l.startswith("search")
                 auc_floor = float(getattr(self.cfg, "search_auc_floor_collapse",
-                                        getattr(self.cfg, "search_auc_floor", 0.52)))
+                                        getattr(self.cfg, "search_auc_floor", 0.50)))
                 auc_floor_streak = int(getattr(self.cfg, "search_auc_floor_streak", 2))
 
                 auc_low = bool(
@@ -1693,20 +1857,44 @@ class QMLEnvEnd2End:
             # ----------------------------------------------------------
             # Choose calibration source: SAME subset used for proxy training (recommended)
             # ----------------------------------------------------------
-            def _get_calib_tensors_from_loader(dl: DataLoader) -> tuple[torch.Tensor, torch.Tensor]:
-                # TensorDataset(Xs, Ys) -> get tensors directly (already on device)
-                """
-                PATCH: stop calibrating thr* on dl_small (too small / unstable).
-                Use full-train stratified cap instead (fixed per seed_offset).
+            # def _get_calib_tensors_from_loader(dl: DataLoader) -> tuple[torch.Tensor, torch.Tensor]:
+            #     # TensorDataset(Xs, Ys) -> get tensors directly (already on device)
+            #     """
+            #     PATCH: stop calibrating thr* on dl_small (too small / unstable).
+            #     Use full-train stratified cap instead (fixed per seed_offset).
 
-                Config knobs (optional):
-                  - calib_cap (default 1024)
-                  - calib_seed_delta (default 99991)  # separates from training seed
+            #     Config knobs (optional):
+            #       - calib_cap (default 1024)
+            #       - calib_seed_delta (default 99991)  # separates from training seed
+            #     """
+            #     cap = int(getattr(self.cfg, "calib_cap", 1024))
+            #     seed_delta = int(getattr(self.cfg, "calib_seed_delta", 99991))
+            #     seed_for_cap = int(self.seed + seed_delta + seed_offset)
+            #     #seed_for_cap = int(self.seed + seed_delta)
+            #     return _stratified_cap_from_train(cap=cap, seed_for_cap=seed_for_cap)
+            def _get_calib_tensors_from_loader(dl: DataLoader) -> tuple[torch.Tensor, torch.Tensor]:
                 """
-                cap = int(getattr(self.cfg, "calib_cap", 1024))
-                seed_delta = int(getattr(self.cfg, "calib_seed_delta", 99991))
-                seed_for_cap = int(self.seed + seed_delta + seed_offset)
-                #seed_for_cap = int(self.seed + seed_delta)
+                FIX-3: Calibrate thr* on a stratified cap from full train, NOT dl_small.
+
+                calib_seed_delta (default 99991) >> max proxy seed offset (2*1337=2674),
+                so the calib subset can never coincide with a proxy evaluation subset.
+
+                This eliminates the systematic val_bce < calib_bce observed in all 5
+                spike episodes (ep047, ep243, ep214, ep158, ep170).
+
+                Config knobs:
+                  - calib_cap        (default 1024)
+                  - calib_seed_delta (default 99991)
+                """
+                # COST-D: smaller calib cap during SEARCH, full cap during FINAL.
+                _is_final = str(getattr(self.cfg, "phase", "search")).lower().startswith("final")
+                cap = int(
+                    getattr(self.cfg, "final_calib_cap",  getattr(self.cfg, "calib_cap", 1024))
+                    if _is_final else
+                    getattr(self.cfg, "search_calib_cap", getattr(self.cfg, "calib_cap", 256))
+                )
+                seed_delta    = int(getattr(self.cfg, "calib_seed_delta", 99991))
+                seed_for_cap  = int(self.seed) + int(seed_delta) + int(seed_offset)
                 return _stratified_cap_from_train(cap=cap, seed_for_cap=seed_for_cap)
 
             # ----------------------------------------------------------
@@ -1773,8 +1961,6 @@ class QMLEnvEnd2End:
             # 1) warmup head
             # In SEARCH head-only we already froze VQC; in FINAL we freeze here as usual.
             #if not search_head_only:
-            print(">>> HEAD WARMUP <<<") 
-            print(model.head.bias.item() if model.head.bias is not None else "no_bias")
             if True: 
                 for p in model.parameters():
                     p.requires_grad_(False)
@@ -1817,11 +2003,28 @@ class QMLEnvEnd2End:
                         elif yb.dim() == 1:
                             yb = yb.view(-1, 1)
 
-                        loss = crit(model(xb), yb)
+                        logits_b = model(xb)
+                        loss = crit(logits_b, yb)
                         opt_head.zero_grad(set_to_none=True)
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(model.head.parameters(), max_norm=1.0)
                         opt_head.step()
+                        # ---------------------------
+                        # LEVEL 1: batch loss logging (head warmup)
+                        # ---------------------------
+                        if bool(getattr(self.cfg, "log_loss_per_iter", True)):
+                            log_every = int(getattr(self.cfg, "loss_log_every", 10))
+                            if ((bi % log_every) == 0) or (bi == 0):
+                                loss_f = float(loss.detach().cpu().item())
+                                # EMA para ficar legível
+                                if not hasattr(self, "_ema_head_loss"):
+                                    self._ema_head_loss = None
+                                self._ema_head_loss = _ema_update(self._ema_head_loss, loss_f, alpha=float(getattr(self.cfg, "loss_ema_alpha", 0.05)))
+                                self.logger.log_to_file(
+                                    "loss_iter",
+                                    f"[head][iter] seed_off={seed_offset} he={_he} bi={bi} "
+                                    f"loss={loss_f:.6f} ema={float(self._ema_head_loss):.6f}"
+                                )
                         if (not phase.startswith("final")) and (model.head.bias is not None):
                             bmax = float(getattr(self.cfg, "search_head_bias_clamp", 2.0))
                             with torch.no_grad():
@@ -1869,7 +2072,11 @@ class QMLEnvEnd2End:
                     if model.head.bias is not None:
                         model.head.bias.requires_grad_(True)
                     # override VQC batches to 0 by default (hard head-only)
-                    n_vqc_batches = int(max(0, search_vqc_batches_override))
+                # Aplica override APENAS se explicitamente definido (>= 0)
+                # Com search_head_only=False (novo default) este bloco não executa
+                if int(search_vqc_batches_override) >= 0:
+                    n_vqc_batches = int(search_vqc_batches_override)
+                # else: mantém n_vqc_batches do config (inner_train_batches_vqc)
                 else:
                     # legacy SEARCH behavior: allow full unfreeze
                     _unfreeze_all_params(model)
@@ -2029,7 +2236,13 @@ class QMLEnvEnd2End:
             if hasattr(model, "theta") and isinstance(model.theta, torch.nn.Parameter):
                 theta_params.append(model.theta)
             theta_params = _uniq(theta_params)
-
+            # Onde você monta os param_groups do otimizador, após theta_params:
+            if hasattr(model, 'logit_scale') and model.logit_scale.requires_grad:
+                param_groups.append({
+                    'params': [model.logit_scale],
+                    'lr': lr_head,
+                    'weight_decay': 0.0
+                })
             # ---- build groups ----
             if head_w:
                 param_groups.append({"params": head_w, "lr": lr_head, "weight_decay": wd_head})
@@ -2057,6 +2270,7 @@ class QMLEnvEnd2End:
             opt = torch.optim.Adam(param_groups)
 
             for _ in range(n_epochs):
+                epoch_losses = []
                 model.train()
                 for bi, (xb, yb) in enumerate(dl_small):
                     # if (search_head_only and (not phase_local.startswith("final")) and int(n_vqc_batches) == 0):
@@ -2104,6 +2318,26 @@ class QMLEnvEnd2End:
 
                     opt.step()
 
+                    try:
+                        epoch_losses.append(float(loss.detach().cpu().item()))
+                    except Exception:
+                        pass
+                    # ---------------------------
+                    # LEVEL 1: batch loss logging (proxy-train)
+                    # ---------------------------
+                    if bool(getattr(self.cfg, "log_loss_per_iter", True)):
+                        log_every = int(getattr(self.cfg, "loss_log_every", 10))
+                        if ((bi % log_every) == 0) or (bi == 0):
+                            loss_f = float(loss.detach().cpu().item())
+                            if not hasattr(self, "_ema_proxy_loss"):
+                                self._ema_proxy_loss = None
+                            self._ema_proxy_loss = _ema_update(self._ema_proxy_loss, loss_f, alpha=float(getattr(self.cfg, "loss_ema_alpha", 0.05)))
+                            self.logger.log_to_file(
+                                "loss_iter",
+                                f"[proxy][iter] seed_off={seed_offset} ep={_} bi={bi} "
+                                f"loss={loss_f:.6f} ema={float(self._ema_proxy_loss):.6f}"
+                            )
+
                     # NEW: always clamp bias in SEARCH (post-step)
                     phase_now = str(getattr(self.cfg, "phase", "search")).lower()
                     if (not phase_now.startswith("final")) and (model.head.bias is not None):
@@ -2121,6 +2355,17 @@ class QMLEnvEnd2End:
                     else:
                         if (bi + 1) >= n_vqc_batches:
                             break
+                # ---------------------------
+                # LEVEL 2: epoch loss logging
+                # ---------------------------
+                if bool(getattr(self.cfg, "log_loss_per_epoch", True)) and (len(epoch_losses) > 0):
+                    m = float(np.mean(epoch_losses))
+                    s = float(np.std(epoch_losses))
+                    self.logger.log_to_file(
+                        "loss_epoch",
+                        f"[proxy][epoch] seed_off={seed_offset} ep={_} "
+                        f"loss_mean={m:.6f} loss_std={s:.6f} n_batches={len(epoch_losses)}"
+                    )
             # ----------------------------------------------------------
             # NEW: explicit separability log right after proxy-train
             # (helps debug "dead head" vs "dead circuit")
@@ -2397,6 +2642,18 @@ class QMLEnvEnd2End:
                 yt_full = (Y_cal.detach().cpu().numpy().reshape(-1) > 0.5).astype(np.int32)
                 yt = yt_full[:n]
 
+                # ---------------------------
+                # LEVEL 3A: calib loss (BCE on logits) for episode reporting
+                # ---------------------------
+                try:
+                    # recomputa logits no torch para loss exata (evita mismatch numpy)
+                    with torch.no_grad():
+                        model.eval()
+                        logits_t = model(X_cal[:n].detach())
+                        calib_loss = _bce_logits_loss_torch(logits_t, Y_cal[:n].detach(), pos_weight=pos_weight_eff)
+                except Exception:
+                    calib_loss = float("nan")
+
                 # ----------------------------------------------------------
                 # SEARCH: recenter logits BEFORE threshold search
                 # Fixes seed instability where probs drift to ~0.02 (all-negative)
@@ -2496,6 +2753,13 @@ class QMLEnvEnd2End:
                     except Exception:
                         pass
                 else:
+                    # COST-D: coarse grid during SEARCH, full grid during FINAL.
+                    _gphase = str(getattr(self.cfg, "phase", "search")).lower()
+                    _grid   = int(
+                        getattr(self.cfg, "grid_size", 201)
+                        if _gphase.startswith("final")
+                        else getattr(self.cfg, "search_grid_size", 51)
+                    )
                     thr_star, thr_info = find_threshold(
                         yt,
                         probs_tr,
@@ -2503,7 +2767,8 @@ class QMLEnvEnd2End:
                         sens_target=float(thr_sens_target),
                         fpr_max=float(thr_fpr_max),
                         spec_min=float(thr_spec_min),
-                        grid_size=int(getattr(self.cfg, "grid_size", 401)),
+                        # grid_size=int(getattr(self.cfg, "grid_size", 401)),
+                        grid_size=_grid,
                         lam_spec=float(lam_spec),
                         lam_fpr=float(lam_fpr),
                         lam_sens=float(lam_sens),
@@ -2525,6 +2790,21 @@ class QMLEnvEnd2End:
 
                 auc, sens, spec = self._eval_metrics(model, self.X_val, self.Y_val, thr=float(thr_star))
 
+
+                # ---------------------------
+                # LEVEL 3B: validation loss (BCE) for episode reporting
+                # ---------------------------
+                try:
+                    with torch.no_grad():
+                        model.eval()
+                        # cap pra ficar barato e consistente com sua filosofia
+                        capv = int(getattr(self.cfg, "val_loss_cap", getattr(self.cfg, "inner_eval_batch_cap", 2048)))
+                        nv = int(min(int(capv), int(self.X_val.shape[0])))
+                        logits_v = model(self.X_val[:nv].detach())
+                        val_loss = _bce_logits_loss_torch(logits_v, self.Y_val[:nv].detach(), pos_weight=pos_weight_eff)
+                except Exception:
+                    val_loss = float("nan")
+
                 # viable_count = int(thr_info.get("viable_count", 0)) if isinstance(thr_info, dict) else 0
                 # auc_val = float(auc)
                 # auc_eps = float(getattr(self.cfg, "collapse_auc_eps", 0.01))
@@ -2542,7 +2822,7 @@ class QMLEnvEnd2End:
                 phase_now = str(getattr(self.cfg, "phase", "search")).lower()
                 is_search_now = phase_now.startswith("search")
                 auc_floor = float(getattr(self.cfg, "search_auc_floor_collapse",
-                                        getattr(self.cfg, "search_auc_floor", 0.52)))
+                                        getattr(self.cfg, "search_auc_floor", 0.50)))
                 auc_low = bool(is_search_now and np.isfinite(auc_val) and (auc_val < auc_floor))
 
                 logit_margin = float(_p95_p5(np.asarray(logits_tr, dtype=float)))
@@ -2649,7 +2929,8 @@ class QMLEnvEnd2End:
                     except Exception:
                         pass
 
-
+            best_pack["calib_bce"] = float(locals().get("calib_loss", float("nan")))
+            best_pack["val_bce"]   = float(locals().get("val_loss",   float("nan")))
             assert best_pack is not None
             best_pack["model"] = model
             return best_pack
@@ -2665,28 +2946,102 @@ class QMLEnvEnd2End:
             # packs = []
             # for so in range(n_seeds):
             #     packs.append(_one_proxy_run(seed_offset=int(so)))
-            use2 = bool(getattr(self.cfg, "proxy_two_seeds", False))
-            delta = int(getattr(self.cfg, "proxy_seed_delta", 1337))
-            seed_offsets = [0, delta] if use2 else [0]
+            # use2 = bool(getattr(self.cfg, "proxy_two_seeds", False))
+            # delta = int(getattr(self.cfg, "proxy_seed_delta", 1337))
+            # seed_offsets = [0, delta] if use2 else [0]
 
-            packs = [ _one_proxy_run(seed_offset=int(so)) for so in seed_offsets ]
-            n_seeds = len(seed_offsets)
+            # packs = [ _one_proxy_run(seed_offset=int(so)) for so in seed_offsets ]
+            # n_seeds = len(seed_offsets)
 
-            # melhor pack (AUC primário, depois SPEC, depois SENS)
-            def _key(pk):
-                return (float(pk.get("auc", 0.0)), float(pk.get("spec", 0.0)), float(pk.get("sens", 0.0)))
-            best_pack = max(packs, key=_key)
+            # # melhor pack (AUC primário, depois SPEC, depois SENS)
+            # def _key(pk):
+            #     return (float(pk.get("auc", 0.0)), float(pk.get("spec", 0.0)), float(pk.get("sens", 0.0)))
+            # best_pack = max(packs, key=_key)
 
-            # std_proxy (pra sua penalização lambda_var)
+            # # std_proxy (pra sua penalização lambda_var)
+            # proxy_scores = []
+            # for pk in packs:
+            #     auc01 = float(np.clip(pk.get("auc", 0.5), 0.0, 1.0))
+            #     sens  = float(np.clip(pk.get("sens", 0.0), 0.0, 1.0))
+            #     spec  = float(np.clip(pk.get("spec", 0.0), 0.0, 1.0))
+            #     youden = float(np.clip(sens + spec - 1.0, -1.0, 1.0))
+            #     youden01 = 0.5 * (youden + 1.0)
+            #     proxy_scores.append(0.5 * auc01 + 0.5 * youden01)
+            # std_proxy = float(np.std(np.asarray(proxy_scores, dtype=float))) if len(proxy_scores) > 1 else 0.0
+
+            # # atualiza cache do env (usado no shaping do step)
+            # self.last_auc  = float(best_pack.get("auc", 0.5))
+            # self.last_sens = float(best_pack.get("sens", 0.0))
+            # self.last_spec = float(best_pack.get("spec", 0.0))
+            # thr_star = float(best_pack.get("thr_star", getattr(self.cfg, "thr_init", 0.5)))
+            # self.thr = float(thr_star)
+
+            # # depth/cnot: se você tiver “tape real”, pluga aqui;
+            # # por enquanto: depth = steps do arch, cnot = contagem do arch (coerente e rápido).
+            # arch_now = torch.tensor(self.state, dtype=torch.int64, device=self.DEVICE)
+            # counts = self._count_ops(arch_now)
+            # depth_t = int(self.step_idx)
+            # cnot_t  = int(counts["CNOT"])
+
+            # # tinfo: garante que sempre tenha std_proxy
+            # tinfo = dict(best_pack.get("thr_info", {})) if isinstance(best_pack.get("thr_info", {}), dict) else {}
+            # tinfo["std_proxy"] = float(std_proxy)
+            # tinfo["n_seeds"] = int(n_seeds)
+            # tinfo["collapse_dbg"] = best_pack.get("collapse_dbg", {})
+            # FIX-2: build seed_offsets from proxy_n_seeds (default 3).
+            # Previously hardcoded [0, delta] with best-of-2 (argmax) aggregation.
+            # With 3 seeds + min() a single lucky seed cannot inflate the score.
+            # corr(std_proxy, AUC) = 0.63 in Cross/Circle logs; min() kills that correlation.
+            use2        = bool(getattr(self.cfg, "proxy_two_seeds", True))
+            delta       = int(getattr(self.cfg, "proxy_seed_delta", 1337))
+            n_seeds_cfg = int(getattr(self.cfg, "proxy_n_seeds", 3 if use2 else 1))
+            n_seeds_cfg = max(1, n_seeds_cfg)
+            seed_offsets = [int(i * delta) for i in range(n_seeds_cfg)]
+
+            packs = [_one_proxy_run(seed_offset=int(so)) for so in seed_offsets]
+            n_seeds = len(packs)
+
+            # Youden-weighted proxy score per seed (same formula as train.py)
             proxy_scores = []
             for pk in packs:
-                auc01 = float(np.clip(pk.get("auc", 0.5), 0.0, 1.0))
-                sens  = float(np.clip(pk.get("sens", 0.0), 0.0, 1.0))
-                spec  = float(np.clip(pk.get("spec", 0.0), 0.0, 1.0))
-                youden = float(np.clip(sens + spec - 1.0, -1.0, 1.0))
-                youden01 = 0.5 * (youden + 1.0)
-                proxy_scores.append(0.5 * auc01 + 0.5 * youden01)
-            std_proxy = float(np.std(np.asarray(proxy_scores, dtype=float))) if len(proxy_scores) > 1 else 0.0
+                auc01_    = float(np.clip(pk.get("auc",  0.5), 0.0, 1.0))
+                sens_     = float(np.clip(pk.get("sens", 0.0), 0.0, 1.0))
+                spec_     = float(np.clip(pk.get("spec", 0.0), 0.0, 1.0))
+                youden_   = float(np.clip(sens_ + spec_ - 1.0, -1.0, 1.0))
+                youden01_ = 0.5 * (youden_ + 1.0)
+                proxy_scores.append(0.5 * auc01_ + 0.5 * youden01_)
+            proxy_arr = np.asarray(proxy_scores, dtype=float)
+            std_proxy = float(np.std(proxy_arr)) if len(proxy_arr) > 1 else 0.0
+
+            # FIX-2: aggregation strategy
+            agg = str(getattr(self.cfg, "proxy_aggregation", "min")).lower().strip()
+            if agg == "min":
+                best_idx = int(np.argmin(proxy_arr))
+            elif agg == "quantile":
+                q     = float(getattr(self.cfg, "proxy_quantile", 0.20))
+                q_val = float(np.quantile(proxy_arr, q))
+                best_idx = int(np.argmin(np.abs(proxy_arr - q_val)))
+            else:  # "mean" / legacy: pick best-scoring seed (old behaviour)
+                best_idx = int(np.argmax(proxy_arr))
+            best_pack = packs[best_idx]
+
+            # FIX-5: thr* stability — std across seeds, exposed to train.py via tinfo
+            thr_stars_all = [float(pk.get("thr_star", 0.5)) for pk in packs]
+            thr_std = float(np.std(np.asarray(thr_stars_all, dtype=float))) if len(thr_stars_all) > 1 else 0.0
+            self._terminal_thr_stars = thr_stars_all
+
+            if bool(getattr(self.cfg, "log_thr_stability", True)):
+                try:
+                    self.logger.log_to_file(
+                        "thr_stability",
+                        f"[thr_stability] n_seeds={n_seeds} agg={agg} "
+                        f"thr_stars={[f'{t:.3f}' for t in thr_stars_all]} "
+                        f"thr_std={thr_std:.4f} "
+                        f"proxy_scores={[f'{s:.4f}' for s in proxy_scores]} "
+                        f"std_proxy={std_proxy:.4f} best_idx={best_idx}"
+                    )
+                except Exception:
+                    pass
 
             # atualiza cache do env (usado no shaping do step)
             self.last_auc  = float(best_pack.get("auc", 0.5))
@@ -2695,18 +3050,23 @@ class QMLEnvEnd2End:
             thr_star = float(best_pack.get("thr_star", getattr(self.cfg, "thr_init", 0.5)))
             self.thr = float(thr_star)
 
-            # depth/cnot: se você tiver “tape real”, pluga aqui;
-            # por enquanto: depth = steps do arch, cnot = contagem do arch (coerente e rápido).
+            # depth/cnot via arch state
             arch_now = torch.tensor(self.state, dtype=torch.int64, device=self.DEVICE)
             counts = self._count_ops(arch_now)
             depth_t = int(self.step_idx)
             cnot_t  = int(counts["CNOT"])
 
-            # tinfo: garante que sempre tenha std_proxy
+            # tinfo: campos obrigatórios para train.py
             tinfo = dict(best_pack.get("thr_info", {})) if isinstance(best_pack.get("thr_info", {}), dict) else {}
             tinfo["std_proxy"] = float(std_proxy)
-            tinfo["n_seeds"] = int(n_seeds)
+            tinfo["thr_std"]   = float(thr_std)        # FIX-5: lambda_thr_std penalty
+            tinfo["n_seeds"]   = int(n_seeds)
             tinfo["collapse_dbg"] = best_pack.get("collapse_dbg", {})
+
+            # FIX-4: register terminal architecture in inter-episode dedup set
+            arch_hash = hash(self.state.tobytes())
+            self._terminal_arch_hashes.add(arch_hash)
+
 
             try:
                 self.logger.log_to_file(
@@ -2714,10 +3074,57 @@ class QMLEnvEnd2End:
                     f"[terminal] phase={phase} auc={self.last_auc:.4f} sens={self.last_sens:.4f} spec={self.last_spec:.4f} "
                     f"thr*={thr_star:.3f} std_proxy={std_proxy:.4f} n_seeds={n_seeds} time={time.perf_counter()-t0:.2f}s"
                 )
+                # FIX-C: one-line split_summary for quick grep verification.
+                # Targets: N_val>=400 confirms FIX-1; delta_gap>>0 confirms FIX-3.
+                _yv2 = (self.Y_val.detach().cpu().numpy().reshape(-1) > 0.5).astype(np.int32)
+                _nv2 = int(len(_yv2))
+                _csd2 = int(getattr(self.cfg, "calib_seed_delta", 99991))
+                _ns2  = int(getattr(self.cfg, "proxy_n_seeds", 3))
+                _d2   = int(getattr(self.cfg, "proxy_seed_delta", 1337))
+                _max_off = (_ns2 - 1) * _d2
+                self.logger.log_to_file(
+                    "terminal_splits",
+                    f"[split_summary] N_val={_nv2}(pos={int(_yv2.sum())},neg={_nv2-int(_yv2.sum())}) "
+                    f"val_frac={getattr(self.cfg,'val_frac_search',0.40):.2f} "
+                    f"percent_search={getattr(self.cfg,'percent_search',60)} "
+                    f"calib_seed_delta={_csd2} max_proxy_offset={_max_off} "
+                    f"delta_gap={_csd2-_max_off}  target:N_val>=400,gap>>0"
+                )
             except Exception:
                 pass
 
-            return (
+
+
+
+            # ---------------------------
+            # LEVEL 3: episode-level error summary (losses + metrics)
+            # ---------------------------
+            _calib_bce = float(best_pack.get("calib_bce", float("nan")))
+            _val_bce   = float(best_pack.get("val_bce",   float("nan")))
+            try:
+                # se calib_loss/val_loss estiverem no escopo do último attempt, ótimo;
+                # se não, loga NaN.
+                self.logger.log_to_file(
+                    "episode",
+                    f"[episode] phase={phase} steps={int(self.step_idx)} "
+                    f"auc={self.last_auc:.4f} sens={self.last_sens:.4f} spec={self.last_spec:.4f} thr*={thr_star:.3f} "
+                    f"calib_bce={_calib_bce:.6f} "
+                    f"val_bce={_val_bce:.6f} "
+                    f"std_proxy={std_proxy:.4f} n_seeds={n_seeds}"
+                )
+            except Exception:
+                pass
+            
+            # return (
+            #     float(self.last_auc),
+            #     float(self.last_sens),
+            #     float(self.last_spec),
+            #     float(thr_star),
+            #     int(depth_t),
+            #     int(cnot_t),
+            #     tinfo,
+            # )
+            _result = (
                 float(self.last_auc),
                 float(self.last_sens),
                 float(self.last_spec),
@@ -2726,6 +3133,14 @@ class QMLEnvEnd2End:
                 int(cnot_t),
                 tinfo,
             )
+            _maxsz = int(getattr(self, "_arch_result_cache_maxsize", 64))
+            if len(self._arch_result_cache) >= _maxsz:
+                try:
+                    del self._arch_result_cache[next(iter(self._arch_result_cache))]
+                except Exception:
+                    pass
+            self._arch_result_cache[_arch_cache_key] = _result
+            return _result
 
         except Exception as e:
             # FAIL-SAFE: nunca retorne None

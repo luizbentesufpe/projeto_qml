@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Any
 from rl_and_qml_in_clinical_images.util import Logger, RunningStd, save_circuit_image
 import numpy as np
@@ -74,11 +75,10 @@ def _proxy_score_search(
     phase: str,
     cfg: Any,
 ) -> tuple[float, dict]:
-    """Compute proxy score for RL objective.
-
-    Key idea:
-      - SEARCH must reward *separability* (ranking): AUC + logit spread
-      - avoid accepting episodes that only 'hold' SPEC via threshold tricks
+    """
+    Compute proxy score for RL objective.
+    
+    CRITICAL FIX: AUC-gate aplicado UMA ÚNICA VEZ para matar scores quando AUC≈0.5.
     """
     auc01 = float(np.clip(float(auc), 0.0, 1.0))
     sens01 = float(np.clip(float(sens), 0.0, 1.0))
@@ -88,67 +88,69 @@ def _proxy_score_search(
     phase_l = str(phase).lower()
     is_final = phase_l.startswith("final")
 
-    # separability from logits (calibration set)
-    # sep_scale = float(getattr(cfg, "final_sep_scale" if is_final else "search_sep_scale", 0.25))
-    # sep01 = _sep01_from_logit_margin(float(logit_margin) if logit_margin is not None else float("nan"), scale=sep_scale)
+    # ========================================
+    # 1) Separabilidade de logits (sem gate ainda)
+    # ========================================
     sep_scale = float(getattr(cfg, "final_sep_scale" if is_final else "search_sep_scale", 0.25))
     sep01_raw = _sep01_from_logit_margin(
         float(logit_margin) if logit_margin is not None else float("nan"),
         scale=sep_scale
     )
 
-    # weights (phase-aware)
-    w_auc = float(getattr(cfg, "final_w_auc" if is_final else "search_w_auc", 0.60 if not is_final else 0.55))
-    w_y  = float(getattr(cfg, "final_w_youden" if is_final else "search_w_youden", 0.20))
-    w_s  = float(getattr(cfg, "final_w_sep" if is_final else "search_w_sep", 0.20 if not is_final else 0.25))
+    # ========================================
+    # 2) Pesos (phase-aware)
+    # ========================================
+    w_auc = float(getattr(cfg, "final_w_auc" if is_final else "search_w_auc", 0.70 if not is_final else 0.55))
+    w_y   = float(getattr(cfg, "final_w_youden" if is_final else "search_w_youden", 0.20))
+    w_s   = float(getattr(cfg, "final_w_sep" if is_final else "search_w_sep", 0.10 if not is_final else 0.25))
     w_sum = max(1e-9, (w_auc + w_y + w_s))
 
-    # base = (w_auc * auc01 + w_y * youden01 + w_s * sep01) / w_sum  # in [0,1]
-    
-    # --------------------------------------------------
-    # CRITICAL FIX:
-    # "spread" sozinho NÃO garante ranking. Então:
-    # 1) sep só pode contribuir se AUC estiver acima do piso
-    # 2) aplica um gate multiplicativo forte em SEARCH quando AUC≈0.5
-    # --------------------------------------------------
-    auc_floor = float(getattr(cfg, "final_auc_floor" if is_final else "search_auc_floor", 0.55 if not is_final else 0.60))
-    tau_gate  = float(getattr(cfg, "final_auc_gate_tau" if is_final else "search_auc_gate_tau", 0.02))
+    # ========================================
+    # 3) AUC-gate (sigmoid, SEARCH apenas)
+    # ========================================
+    auc_floor = float(getattr(cfg, "final_auc_floor" if is_final else "search_auc_floor", 0.60 if is_final else 0.50))
+    tau_gate  = float(getattr(cfg, "final_auc_gate_tau" if is_final else "search_auc_gate_tau", 0.03))
 
-    # gate ∈ (0,1): ~0 quando auc<<auc_floor, ~0.5 em auc=auc_floor, ~1 quando auc>>auc_floor
-    # Isso evita "episódios falsos" com AUC≈0.5 mas logits com range ok.
     if not is_final:
         z = (auc01 - auc_floor) / max(tau_gate, 1e-6)
         auc_gate = float(1.0 / (1.0 + np.exp(-z)))
     else:
         auc_gate = 1.0
 
-    # sep só entra se passar no gate (senão vira incentivo errado)
-    sep01 = float(sep01_raw * auc_gate)
+    # ========================================
+    # 4) CRITICAL FIX: Gate aplicado SOMENTE em sep01
+    #    (sep01 só contribui se AUC > floor)
+    # ========================================
+    sep01_gated = float(sep01_raw * auc_gate)
 
-    base = (w_auc * auc01 + w_y * youden01 + w_s * sep01) / w_sum  # in [0,1]
+    # ========================================
+    # 5) Score base (SEM gate duplo!)
+    # ========================================
+    base = (w_auc * auc01 + w_y * youden01 + w_s * sep01_gated) / w_sum  # [0,1]
 
-    # --- CRITICAL: anti-noise gate in SEARCH ---
-    # If AUC is too close to 0.5, treat it as near-random and penalize strongly.
-    # Em SEARCH, além de "sep gated", aplicamos um gate multiplicativo final no score.
-    # Isso derruba score quando AUC ~0.5, mesmo que você consiga segurar SPEC via thr.
-    if not is_final:
-        base = float(base * auc_gate)
- 
+    # ❌ NÃO APLICAR GATE NOVAMENTE:
+    # if not is_final:
+    #     base = float(base * auc_gate)  # ← DELETADO!
 
-    # optional: also penalize very low separability
+    # ========================================
+    # 6) Penalidade de separabilidade mínima
+    # ========================================
     sep_floor = float(getattr(cfg, "final_sep_floor" if is_final else "search_sep_floor", 0.15))
     lam_sep_floor = float(getattr(cfg, "final_sep_floor_lam" if is_final else "search_sep_floor_lam", 0.50))
     pen_sep = 0.0
-    if (not is_final) and (sep01 < sep_floor):
-        pen_sep = lam_sep_floor * float(sep_floor - sep01)
+    if (not is_final) and (sep01_gated < sep_floor):
+        pen_sep = lam_sep_floor * float(sep_floor - sep01_gated)
 
     score = float(np.clip(base - pen_sep, 0.0, 1.0))
+    
+    # ========================================
+    # 7) Debug dict
+    # ========================================
     dbg = {
-        "auc01": auc01,
-        "youden01": youden01,
-        #"sep01": sep01,
+        "auc01": float(auc01),
+        "youden01": float(youden01),
         "sep01_raw": float(sep01_raw),
-        "sep01": float(sep01),
+        "sep01_gated": float(sep01_gated),
         "base": float(base),
         "pen_sep_floor": float(pen_sep),
         "w": (w_auc, w_y, w_s),
@@ -157,8 +159,9 @@ def _proxy_score_search(
         "auc_gate_tau": float(tau_gate),
         "sep_scale": float(sep_scale),
     }
+    
+    
     return score, dbg
-
 
 def run_arch_search_end2end(X_tr, Y_tr, X_val, Y_val, cfg: Config, logger: Logger, seed: int = 0, device: torch.device | str = "cpu"):
     # SEARCH phase: relax threshold constraints
@@ -336,31 +339,74 @@ def run_arch_search_end2end(X_tr, Y_tr, X_val, Y_val, cfg: Config, logger: Logge
                 # --------------------------------------------------
                 # Mantém o "K" (fixo ou adaptativo), mas baseado em PROXY (não SENS pura)
                 # --------------------------------------------------
-                base_K = float(getattr(cfg, "terminal_reward_K", 10.0))
-                adaptive = bool(getattr(cfg, "terminal_adaptive_K", True))
+                # base_K = float(getattr(cfg, "terminal_reward_K", 10.0))
+                # adaptive = bool(getattr(cfg, "terminal_adaptive_K", True))
+
+                # if adaptive:
+                #     # Warmup: do NOT adapt K when std is near-zero (early episodes)
+                #     d_center = float(proxy_score - 0.5)
+                #     run_score_std.update(d_center)
+                #     warm = int(getattr(cfg, "terminal_K_warmup", 20))
+                #     if int(getattr(run_score_std, "n", 0)) < warm:
+                #         K = float(base_K)
+                #     else:
+                #         target_std = float(getattr(cfg, "terminal_target_std", 0.25))
+                #         scale = float(target_std / (run_score_std.std + 1e-6))
+                #         # hard cap on scale to avoid exploding K
+                #         scale = float(np.clip(scale, 0.25, 2.0))
+                #         K = float(base_K * scale)
+                #     K_min = float(getattr(cfg, "terminal_K_min", 0.5))
+                #     K_max = float(getattr(cfg, "terminal_K_max", 10.0))
+                #     K = float(np.clip(K, K_min, K_max))
+                # else:
+                #     K = float(base_K)
+
+                # FIX-A: curriculum K — ramps K_start→K_end over terminal_curriculum_K_T eps.
+                # With proxy_aggregation="min", proxy_score is systematically conservative.
+                # Small K early avoids large negative terminals that swamp the replay buffer.
+                # After the ramp, std-adaptive scaling continues to keep signal well-calibrated.
+                base_K         = float(getattr(cfg, "terminal_reward_K",       5.0))   # was 10
+                K_start        = float(getattr(cfg, "terminal_K_start",        1.0))
+                K_end          = float(getattr(cfg, "terminal_K_end",          base_K))
+                curriculum_K_T = int(  getattr(cfg, "terminal_curriculum_K_T", 120))
+                adaptive       = bool( getattr(cfg, "terminal_adaptive_K",     True))
+
+                ramp_frac = float(np.clip(ep / max(curriculum_K_T, 1), 0.0, 1.0))
+                K_ramp    = float(K_start + ramp_frac * (K_end - K_start))
 
                 if adaptive:
-                    # Warmup: do NOT adapt K when std is near-zero (early episodes)
                     d_center = float(proxy_score - 0.5)
                     run_score_std.update(d_center)
                     warm = int(getattr(cfg, "terminal_K_warmup", 20))
                     if int(getattr(run_score_std, "n", 0)) < warm:
-                        K = float(base_K)
+                        K = float(K_ramp)
                     else:
-                        target_std = float(getattr(cfg, "terminal_target_std", 0.25))
+                        target_std = float(getattr(cfg, "terminal_target_std", 0.20))
                         scale = float(target_std / (run_score_std.std + 1e-6))
-                        # hard cap on scale to avoid exploding K
                         scale = float(np.clip(scale, 0.25, 2.0))
-                        K = float(base_K * scale)
+                        K = float(K_ramp * scale)
                     K_min = float(getattr(cfg, "terminal_K_min", 0.5))
-                    K_max = float(getattr(cfg, "terminal_K_max", 10.0))
+                    K_max = float(getattr(cfg, "terminal_K_max", base_K * 2.0))
                     K = float(np.clip(K, K_min, K_max))
                 else:
-                    K = float(base_K)
-
+                    K = float(K_ramp)
 
                 #terminal_bonus = float(K * (float(proxy_score) - 0.5) + float(degenerate_penalty) - float(collapse_pen))
-                terminal_bonus = float(K * float(delta_proxy) + float(degenerate_penalty) - float(collapse_pen))
+                # terminal_bonus = float(K * float(delta_proxy) + float(degenerate_penalty) - float(collapse_pen))
+                # FIX-A: two-term bonus compatible with agg=min.
+                # delta_proxy alone stays ≤ 0 for many early episodes when min-agg is used.
+                # abs_signal adds a small positive reward whenever proxy_score > agg_floor
+                # (the expected score at near-random AUC ≈ 0.5). This prevents the reward
+                # from being all-negative before the curriculum K has ramped up.
+                agg_floor  = float(getattr(cfg, "terminal_agg_floor", 0.30))
+                K_abs      = float(getattr(cfg, "terminal_K_abs",     0.5))
+                abs_signal = float(K_abs * max(0.0, float(proxy_score) - agg_floor))
+                terminal_bonus = float(
+                    K * float(delta_proxy)
+                    + abs_signal
+                    + float(degenerate_penalty)
+                    - float(collapse_pen)
+                )
                 
                 # --------------------------------------------------
                 # NÍVEL 2 — penalizar instabilidade do proxy (2 seeds), se env fornecer
@@ -370,7 +416,48 @@ def run_arch_search_end2end(X_tr, Y_tr, X_val, Y_val, cfg: Config, logger: Logge
                     std_proxy = float(tinfo.get("std_proxy", 0.0)) if isinstance(tinfo, dict) else 0.0
                 except Exception:
                     std_proxy = 0.0
-                terminal_bonus -= float(getattr(cfg, "lambda_var", 0.50)) * float(std_proxy)
+                # terminal_bonus -= float(getattr(cfg, "lambda_var", 0.50)) * float(std_proxy)
+                lambda_var = float(getattr(cfg, "lambda_var", 0.50))
+                std_proxy_threshold = float(getattr(cfg, "std_proxy_threshold", 0.05))
+                if float(std_proxy) > std_proxy_threshold:
+                    terminal_bonus *= (std_proxy_threshold / max(float(std_proxy), 1e-6))
+                else:
+                    terminal_bonus -= lambda_var * float(std_proxy)
+
+                # FIX-5: thr* stability penalty.
+                # thr_std is populated by env.terminal_evaluate() and placed in tinfo["thr_std"].
+                # Penalises circuits whose optimal threshold varies across seeds — a signal of
+                # fragile separation that would be unreliable in clinical deployment.
+                # 43.9% of proxy evals in Cross/Circle logs had prob_std < 0.02 (prob collapse);
+                # unstable thr* is the downstream symptom of that fragility.
+                try:
+                    thr_std = float(tinfo.get("thr_std", 0.0)) if isinstance(tinfo, dict) else 0.0
+                except Exception:
+                    thr_std = 0.0
+                thr_std_threshold = float(getattr(cfg, "thr_std_threshold", 0.05))
+                lambda_thr_std    = float(getattr(cfg, "lambda_thr_std",    0.30))
+                if thr_std > thr_std_threshold:
+                    terminal_bonus -= lambda_thr_std * (thr_std - thr_std_threshold)
+
+                # FIX-4: inter-episode architecture repeat penalty (terminal-level).
+                # Applied once per terminal; reads the arch hash set maintained by env.
+                # env.terminal_evaluate() adds the current hash before returning, so
+                # len(_arch_hash_set) > 1 means the arch was seen in a previous episode.
+                try:
+                    _repeat_arch_pen = float(getattr(cfg, "repeat_arch_penalty", 0.50))
+                    _arch_hash_set   = getattr(env, "_terminal_arch_hashes", set())
+                    _arch_hash_now   = hash(env.state.tobytes())
+                    if len(_arch_hash_set) > 1 and _arch_hash_now in _arch_hash_set:
+                        terminal_bonus -= _repeat_arch_pen
+                        env._ep_reward_sums["repeat_arch"] = (
+                            env._ep_reward_sums.get("repeat_arch", 0.0) - _repeat_arch_pen
+                        )
+                    # Bound memory: clear hash set when it exceeds repeat_arch_window.
+                    _win = int(getattr(cfg, "repeat_arch_window", 50))
+                    if len(_arch_hash_set) > _win:
+                        _arch_hash_set.clear()
+                except Exception:
+                    pass
 
 
                 try:
@@ -406,18 +493,30 @@ def run_arch_search_end2end(X_tr, Y_tr, X_val, Y_val, cfg: Config, logger: Logge
                     "collapse_pen": float(collapse_pen),
                     "std_proxy": float(std_proxy),
                     "terminal_bonus": float(terminal_bonus),
-                    "terminal_K": float(K),
+                    # "terminal_K": float(K),
+                    # "terminal_depth": depth_t,
+                    "terminal_K":          float(K),
+                    "terminal_K_ramp":     float(K_ramp),
+                    "terminal_abs_signal": float(abs_signal),
+                    "terminal_agg_floor":  float(agg_floor),
                     "terminal_depth": depth_t,
                     "terminal_cnot": cnot_t,
                  }
 
                 # melhor arquitetura por score terminal (não pelo last_auc stale)
-                if float(effective_score) > float(best_score):
+                std_proxy_gate = float(getattr(cfg, "std_proxy_threshold", 0.05))
+                reliable_score_min = float(getattr(cfg, "reliable_score_min", 0.75))
+                if float(effective_score) > float(best_score) and float(std_proxy) < std_proxy_gate:
                     best_score = float(effective_score)
                     best_arch  = env.state.copy()
                     best_nq = env.current_n_qubits
                     best_proxy = float(effective_score)
-
+                # salva archs confiáveis acima do limiar independente do best
+                if float(std_proxy) < std_proxy_gate and float(effective_score) > reliable_score_min:
+                    logger.log_to_file("reliable_archs",
+                        f"[ep {ep+1:03d}] score={effective_score:.4f} std_proxy={std_proxy:.4f} "
+                        f"nq={env.current_n_qubits} thr_std={thr_std:.4f} "
+                        f"arch_hash={hash(env.state.tobytes())}")
                 # injeta o bônus no último reward do episódio
                 r = float(r) + float(terminal_bonus)
                 info = dict(info)
@@ -780,17 +879,64 @@ def train_final_model_end2end(arch_mat: torch.Tensor, n_qubits: int, X_trval, Y_
     # --- final evaluation on X_te/Y_te ---
     auc_te, sens_te = eval_metrics_final(model, X_te, Y_te, thr=thr_star, device=DEVICE)
     logger.log_to_file("final_test", f"[TEST] thr*={thr_star:.3f} AUC={auc_te:.4f} SENS@thr*={sens_te:.4f}")
+    # ── Salva parâmetros de encoding (α, β) do modelo treinado ──────
+    try:
+        import torch.nn.functional as F
+        with torch.no_grad():
+            _enc = {}
+            if hasattr(model, "enc_alpha_raw"):
+                _a = F.softplus(model.enc_alpha_raw.detach().cpu()) + 1e-6
+                _b = torch.tanh(model.enc_beta_raw.detach().cpu()) * float(getattr(model, "enc_beta_max", 1.0))
+                _enc["alpha"] = _a.numpy()          # shape depende do enc_affine_mode
+                _enc["beta"]  = _b.numpy()
+                _enc["mode"]  = str(getattr(model, "enc_affine_mode", "unknown"))
+                _enc["thr_star"] = float(thr_star)
+                _enc["auc_te"]   = float(auc_te)
+                _enc["sens_te"]  = float(sens_te)
+
+            _pt_path = Path(str(logger.log_dir)) / "enc_params_final.pt"
+            torch.save(_enc, str(_pt_path))
+            logger.log_to_file(
+                "enc_params",
+                f"[SAVED] enc_params_final.pt | "
+                f"alpha_mean={float(_enc['alpha'].mean()):.4f} "
+                f"alpha_std={float(_enc['alpha'].std()):.4f} "
+                f"beta_mean={float(_enc['beta'].mean()):.4f}"
+            )
+    except Exception as _e:
+        logger.log_to_file("enc_params", f"[WARN] could not save enc_params: {_e}")
+    # ─────────────────────────────────────────────────────────────────
+    
     # >>> no final da função, antes do return (pós-treino)
+    # FIX-E bug 2: o model treinado usa lightning.qubit/gpu (adjoint),
+    # que não suporta qml.draw_mpl.
+    # Solução: instanciar um model de desenho idêntico com diff_method="backprop"
+    # (default.qubit), copiar o state_dict treinado, e só então desenhar.
     try:
         safe_prefix = "final_circuit"
         out_img = (logger.log_dir / f"circuit_{safe_prefix}_nq{n_qubits}_posttrain.png")
+        _draw_model = BinaryCQV_End2End(
+            arch_mat=arch_mat,
+            n_qubits=n_qubits,
+            enc_lambda=float(cfg.enc_lambda),
+            diff_method="backprop",           # default.qubit: único device com draw_mpl
+            input_dim=int(np.asarray(X_trval).shape[1]),
+            enc_affine_mode=str(getattr(cfg, "enc_affine_mode", "per_feature")),
+            enc_alpha_init=float(getattr(cfg, "enc_alpha_init", 1.0)),
+            enc_beta_init=float(getattr(cfg, "enc_beta_init", 0.0)),
+            enc_beta_max=float(getattr(cfg, "enc_beta_max", 1.0)),
+            use_batched_qnode=False,          # single-sample para o draw
+        ).to("cpu")
+        # Copia pesos treinados (theta, enc_alpha_raw, enc_beta_raw, head, logit_scale)
+        _draw_model.load_state_dict(model.cpu().state_dict(), strict=False)
         save_circuit_image(
-            model,
+            _draw_model,
             x_ref=np.asarray(X_trval)[0],
             out_path=str(out_img),
             title=f"Final circuit (nq={n_qubits}) - posttrain"
         )
         logger.log_to_file("circuit", f"[SAVED] {out_img}")
+        del _draw_model
     except Exception as e:
         logger.log_to_file("circuit", f"[WARN] could not save posttrain circuit: {e}")
 
